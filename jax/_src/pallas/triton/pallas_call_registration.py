@@ -110,6 +110,7 @@ def pallas_call_lowering(
           triton_params["serialized_metadata"]
       )
   return mlir.custom_call(
+      # call_target_name="__gpu$xla.gpu.ptx",
       call_target_name="__gpu$xla.gpu.triton",
       result_types=out_types,
       operands=in_nodes,

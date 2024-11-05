@@ -193,12 +193,19 @@ def ptx_lowering(
         kwargs = dict()
         kwargs.setdefault("api_version", 4)
         # We currently only support PTX
-        params["device_kernel_type"] = "ptx"
-        params["ptx_code"] = ptx_code
+        # params["name"] = kernel_name
+        # params["device_kernel_type"] = "ptx"
+        # params["ptx_code"] = ptx_code
         # kwargs["device_kernel_type"] = "ptx"
         # kwargs["ptx_code"] = ptx_code
+        backend_config = dict(
+          name=kernel_name,
+          source=ptx_code,
+        )
+        backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
 
-        kwargs["backend_config"] = {k: mlir.ir_attribute(v) for k, v in params.items()}
+        result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
+        # kwargs["backend_config"] = {k: mlir.ir_attribute(v) for k, v in params.items()}
 
         if "result_types" not in kwargs:
             kwargs["result_types"] = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
@@ -210,7 +217,7 @@ def ptx_lowering(
             mlir.shape_tensor(mlir.eval_dynamic_shape_as_ivals(ctx, _aval_shape(aval)))
             for aval in ctx.avals_out]
 
-        return mlir.custom_call(kernel_name, operands=operands, **kwargs).results  # type: ignore
+        return mlir.custom_call("__gpu$xla.gpu.ptx", operands=operands, result_types=result_types, backend_config=backend_config).results  # type: ignore
 
     return _lowering
 
