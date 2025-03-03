@@ -1,4 +1,3 @@
-
 import ctypes
 
 from jax._src import core
@@ -99,32 +98,57 @@ def ptx_call(
     kernel_name: str,
     result_shape_dtypes: ResultMetadata | Sequence[ResultMetadata],
     *args: ArrayLike,
+    grid_dims: tuple[int, int, int] = (1, 1, 1),
+    block_dims: tuple[int, int, int] = (256, 1, 1),
+    shared_mem_bytes: int = 0,
     has_side_effect: bool = False,
     vmap_method: str | None = None,
     vectorized: bool | DeprecatedArg = DeprecatedArg(),
     **kwargs: Any,
-) -> Array | list[Array]: # type: ignore
-  print("args", args)
-  if isinstance(result_shape_dtypes, Sequence):
-    multiple_results = True
-    result_avals = _result_avals(result_shape_dtypes)
-  else:
-    multiple_results = False
-    result_avals = _result_avals((result_shape_dtypes,))
-  results = ptx_call_p.bind(
-      *args,
-      result_avals=result_avals,
-      vectorized=vectorized,
-      vmap_method=vmap_method,
-      kernel_name=kernel_name,
-      ptx_code=ptx_code,
-      has_side_effect=has_side_effect,
-      **_wrap_kwargs_hashable(kwargs),
-  )
-  if multiple_results:
-    return results
-  else:
-    return results[0]
+) -> Array | list[Array]:  # type: ignore
+    if isinstance(result_shape_dtypes, Sequence):
+        multiple_results = True
+        result_avals = _result_avals(result_shape_dtypes)
+    else:
+        multiple_results = False
+        result_avals = _result_avals((result_shape_dtypes,))
+
+    # Normalize grid and block dims to 3D tuples
+    if isinstance(grid_dims, int):
+        grid_dims = (grid_dims, 1, 1)
+    elif len(grid_dims) == 1:
+        grid_dims = (grid_dims[0], 1, 1)
+    elif len(grid_dims) == 2:
+        grid_dims = (*grid_dims, 1)
+
+    if isinstance(block_dims, int):
+        block_dims = (block_dims, 1, 1)
+    elif len(block_dims) == 1:
+        block_dims = (block_dims[0], 1, 1)
+    elif len(block_dims) == 2:
+        block_dims = (*block_dims, 1)
+  
+    kwargs = {
+        "grid_x": grid_dims[0],
+        "grid_y": grid_dims[1],
+        "grid_z": grid_dims[2],
+        "block_x": block_dims[0],
+        "block_y": block_dims[1],
+        "block_z": block_dims[2],
+        "shared_mem_bytes": shared_mem_bytes,
+        **kwargs,
+    }
+    results = ptx_call_p.bind(
+        *args,
+        result_avals=result_avals,
+        vectorized=vectorized,
+        vmap_method=vmap_method,
+        kernel_name=kernel_name,
+        ptx_code=ptx_code,
+        has_side_effect=has_side_effect,
+        **_wrap_kwargs_hashable(kwargs),
+    )
+    return results if multiple_results else results[0]
 
 def _unwrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
   unwrapped_kwargs: dict[str, Any] = {}
@@ -183,41 +207,58 @@ PtxLayoutOptions = Sequence[int] | DeviceLocalLayout | None
 def ptx_lowering(
     ptx_code: str,
     kernel_name: str,
+    grid_x: int,
+    grid_y: int,
+    grid_z: int,
+    block_x: int,
+    block_y: int,
+    block_z: int,
+    shared_mem_bytes: int,
     *,
     operand_layouts: None = None,
     result_layouts: Sequence[PtxLayoutOptions] | None = None,
     backend_config: Mapping[str, ir.Attribute] | None = None,
     **lowering_args: Any
 ) -> mlir.LoweringRule:
-    def _lowering(ctx: mlir.LoweringRuleContext, *operands: ir.Value, **params: Any) -> Sequence[ir.Value | Sequence[ir.Value]]:
-        kwargs = dict()
-        kwargs.setdefault("api_version", 4)
-        # We currently only support PTX
-        # params["name"] = kernel_name
-        # params["device_kernel_type"] = "ptx"
-        # params["ptx_code"] = ptx_code
-        # kwargs["device_kernel_type"] = "ptx"
-        # kwargs["ptx_code"] = ptx_code
-        backend_config = dict(
-          name=kernel_name,
-          source=ptx_code,
-        )
+    def _lowering(
+        ctx: mlir.LoweringRuleContext, 
+        *operands: ir.Value, 
+        **params: Any
+    ) -> Sequence[ir.Value | Sequence[ir.Value]]:
+        kwargs = {"api_version": 4}
+        
+        backend_config = {
+            "name": kernel_name,
+            "source": ptx_code,
+            "grid_x": grid_x,
+            "grid_y": grid_y,
+            "grid_z": grid_z,
+            "block_x": block_x,
+            "block_y": block_y,
+            "block_z": block_z,
+            "shared_mem_bytes": mlir.i32_attr(shared_mem_bytes),
+        }
         backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
 
         result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
-        # kwargs["backend_config"] = {k: mlir.ir_attribute(v) for k, v in params.items()}
 
         if "result_types" not in kwargs:
             kwargs["result_types"] = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
-        # kwargs["operand_layouts"] = map(_convert_layout, ctx.avals_in)
-        # kwargs["result_layouts"] = map(_convert_layout, ctx.avals_out)
-        if "result_shapes" not in kwargs and not all(
-            core.is_constant_shape(_aval_shape(aval)) for aval in ctx.avals_out):
-            kwargs["result_shapes"] = [
-            mlir.shape_tensor(mlir.eval_dynamic_shape_as_ivals(ctx, _aval_shape(aval)))
-            for aval in ctx.avals_out]
 
-        return mlir.custom_call("__gpu$xla.gpu.ptx", operands=operands, result_types=result_types, backend_config=backend_config).results  # type: ignore
+        if "result_shapes" not in kwargs and not all(
+            core.is_constant_shape(_aval_shape(aval)) for aval in ctx.avals_out
+        ):
+            kwargs["result_shapes"] = [
+                mlir.shape_tensor(mlir.eval_dynamic_shape_as_ivals(ctx, _aval_shape(aval)))
+                for aval in ctx.avals_out
+            ]
+
+        return mlir.custom_call(
+            "__gpu$xla.gpu.ptx",
+            operands=operands,
+            result_types=result_types,
+            backend_config=backend_config
+        ).results
 
     return _lowering
 
@@ -241,10 +282,9 @@ def ptx_call_abstract_eval(
     has_side_effect: bool,
     **kwargs: Any,
 ):
-  del avals_in, kernel_name, ptx_code, vectorized, vmap_method, kwargs
-  # effects = {_PtxEffect} if has_side_effect else core.no_effects
-  effects = core.no_effects
-  return result_avals, effects
+    del avals_in, kernel_name, ptx_code, vectorized, vmap_method, kwargs
+    effects = core.no_effects
+    return result_avals, effects
 
 
 def ptx_call_lowering(
@@ -259,7 +299,18 @@ def ptx_call_lowering(
     **kwargs: Any,
 ) -> Sequence[ir.Value]:
     del result_avals, vectorized, vmap_method
-    rule = ptx_lowering(ptx_code, kernel_name, has_side_effect=has_side_effect)
+    rule = ptx_lowering(
+        ptx_code,
+        kernel_name,
+        kwargs["grid_x"],
+        kwargs["grid_y"], 
+        kwargs["grid_z"],
+        kwargs["block_x"],
+        kwargs["block_y"],
+        kwargs["block_z"],
+        kwargs["shared_mem_bytes"],
+        has_side_effect=has_side_effect
+    )
     return rule(ctx, *operands, **_unwrap_kwargs_hashable(kwargs))
 
 ptx_call_p = core.Primitive("ptx_call")

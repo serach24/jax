@@ -2,33 +2,8 @@ import jax
 import jax.numpy as jnp
 import jax.extend as jex
 
-# PTX code with multiple kernels
-# ptx_code = """
-# .version 7.0
-# .target sm_70
-# .address_size 64
-
-# .extern .global .align 4 .b8 out[];
-
-# .entry add_vectors(
-#     .param .u64 in1, .param .u64 in2, .param .u64 out
-# ) {
-#     .reg .s32 r<3>;
-#     .reg .u64 p<3>;
-    
-#     ld.param.u64 p1, [in1];
-#     ld.param.u64 p2, [in2];
-#     ld.param.u64 p3, [out];
-    
-#     mov.u32 r0, %tid.x;
-
-#     ld.global.f32 r1, [p1 + r0 * 4];
-#     ld.global.f32 r2, [p2 + r0 * 4];
-#     add.f32 r3, r1, r2;
-
-#     st.global.f32 [p3 + r0 * 4], r3;
-# }
-# """
+# Set print options to display the full array
+jnp.set_printoptions(threshold=jnp.inf)
 
 ptx_code = """
 .version 8.5
@@ -76,9 +51,9 @@ result_add = jex.device_kernels.ptx_call(
     "add_vectors",          # Specify the kernel to invoke
     jax.ShapeDtypeStruct(a.shape, a.dtype), # Output shape and dtype
     a,
-    b
-    # grid_dims=(4, 1, 1),                # 4 blocks
-    # block_dims=(256, 1, 1),             # 256 threads per block
-    # shared_mem_bytes=0,                 # No shared memory
-    # output_shapes=((1024,),),           # Output shape is a vector of 1024 elements
+    b,
+    grid_dims=(4, 1, 1),
+    block_dims=(1024, 1, 1),
+    shared_mem_bytes=0,
 )
+print(result_add)
