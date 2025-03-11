@@ -52,8 +52,9 @@ result_add = jex.device_kernels.ptx_call(
     jax.ShapeDtypeStruct(a.shape, a.dtype), # Output shape and dtype
     a,
     b,
-    grid_dims=(4, 1, 1),
+    grid_dims=(1, 1, 1),
     block_dims=(1024, 1, 1),
     shared_mem_bytes=0,
+    output_indices=[2]
 )
 print(result_add)

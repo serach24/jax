@@ -102,6 +102,7 @@ def ptx_call(
     block_dims: tuple[int, int, int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
     has_side_effect: bool = False,
+    output_indices: Sequence[int] | None = None,
     vmap_method: str | None = None,
     vectorized: bool | DeprecatedArg = DeprecatedArg(),
     **kwargs: Any,
@@ -112,6 +113,21 @@ def ptx_call(
     else:
         multiple_results = False
         result_avals = _result_avals((result_shape_dtypes,))
+
+    if output_indices is not None:
+        expected_num_outputs = len(result_avals)
+        if not isinstance(output_indices, (list, tuple)):
+            raise ValueError("output_indices must be a sequence")
+        if len(output_indices) != expected_num_outputs:
+            raise ValueError(
+                f"Expected {expected_num_outputs} output indices but got {len(output_indices)}"
+            )
+        if not all(isinstance(idx, int) and 0 <= idx < len(args) + expected_num_outputs for idx in output_indices):
+            raise ValueError(
+                f"Output indices must be integers in range [0, {len(args)}), got {output_indices}"
+            )
+
+    output_indices = np.array([] if output_indices is None else output_indices)
 
     # Normalize grid and block dims to 3D tuples
     if isinstance(grid_dims, int):
@@ -136,6 +152,7 @@ def ptx_call(
         "block_y": block_dims[1],
         "block_z": block_dims[2],
         "shared_mem_bytes": shared_mem_bytes,
+        "output_indices": output_indices,
         **kwargs,
     }
     results = ptx_call_p.bind(
@@ -203,7 +220,6 @@ def pycapsule(funcptr):
 
 
 PtxLayoutOptions = Sequence[int] | DeviceLocalLayout | None
-# TODO(chenhao): add args
 def ptx_lowering(
     ptx_code: str,
     kernel_name: str,
@@ -214,10 +230,7 @@ def ptx_lowering(
     block_y: int,
     block_z: int,
     shared_mem_bytes: int,
-    *,
-    operand_layouts: None = None,
-    result_layouts: Sequence[PtxLayoutOptions] | None = None,
-    backend_config: Mapping[str, ir.Attribute] | None = None,
+    output_indices: Sequence[int] | None = None,
     **lowering_args: Any
 ) -> mlir.LoweringRule:
     def _lowering(
@@ -227,6 +240,11 @@ def ptx_lowering(
     ) -> Sequence[ir.Value | Sequence[ir.Value]]:
         kwargs = {"api_version": 4}
         
+        if isinstance(output_indices, HashableArray):
+            output_indices_val = list(output_indices.val)
+        else:
+            output_indices_val = list(output_indices)
+
         backend_config = {
             "name": kernel_name,
             "source": ptx_code,
@@ -236,8 +254,10 @@ def ptx_lowering(
             "block_x": block_x,
             "block_y": block_y,
             "block_z": block_z,
-            "shared_mem_bytes": mlir.i32_attr(shared_mem_bytes),
+            "shared_mem_bytes": shared_mem_bytes,
+            "output_indices": output_indices_val,
         }
+        
         backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
 
         result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
@@ -309,7 +329,7 @@ def ptx_call_lowering(
         kwargs["block_y"],
         kwargs["block_z"],
         kwargs["shared_mem_bytes"],
-        has_side_effect=has_side_effect
+        kwargs["output_indices"],
     )
     return rule(ctx, *operands, **_unwrap_kwargs_hashable(kwargs))
 
