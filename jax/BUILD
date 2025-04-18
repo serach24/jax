@@ -298,6 +298,7 @@ py_library_providing_imports_info(
         "_src/blocked_sampler.py",
         "_src/checkify.py",
         "_src/debugging.py",
+        "_src/device_kernels.py",
         "_src/dlpack.py",
         "_src/interpreters/__init__.py",
         "_src/prng.py",

@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
-# from jax.extend.device_kernels import kernel_call
-from jax._src.extend.device_kernels import kernel_call
+from jax.experimental.device_kernels import kernel_call
 
 
 # Set print options to display the full array
