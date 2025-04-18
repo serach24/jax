@@ -16,7 +16,7 @@
 # See PEP 484 & https://github.com/jax-ml/jax/issues/7570
 
 from jax._src.extend.device_kernels import (
-    ptx_call as ptx_call,
-    ptx_lowering as ptx_lowering,
+    kernel_call as kernel_call,
+    kernel_lowering as kernel_lowering,
     pycapsule as pycapsule,
 )

@@ -1,11 +1,13 @@
 import jax
 import jax.numpy as jnp
-import jax.extend as jex
+# from jax.extend.device_kernels import kernel_call
+from jax._src.extend.device_kernels import kernel_call
+
 
 # Set print options to display the full array
 jnp.set_printoptions(threshold=jnp.inf)
 
-ptx_code = """
+ptx_source = """
 .version 8.5
 .target sm_90
 .address_size 64
@@ -44,17 +46,18 @@ ptx_code = """
 a = jnp.ones(1024, dtype=jnp.float32)
 b = jnp.ones(1024, dtype=jnp.float32)
 
-# Call the 'add_vectors' PTX kernel
-# result_add = jax.device_kernels.call(
-result_add = jex.device_kernels.ptx_call(
-    ptx_code,
+# Call the 'add_vectors' kernel using the kernel_call API
+result_add = kernel_call(
+    ptx_source,
     "add_vectors",          # Specify the kernel to invoke
     jax.ShapeDtypeStruct(a.shape, a.dtype), # Output shape and dtype
     a,
     b,
+    kernel_type="ptx",      # Explicitly specify kernel type
     grid_dims=(1, 1, 1),
     block_dims=(1024, 1, 1),
     shared_mem_bytes=0,
     output_indices=[2]
 )
+print("Result of vector addition:")
 print(result_add)

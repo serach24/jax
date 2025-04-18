@@ -15,13 +15,17 @@ import numpy as np
 
 from typing import Any
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
 from jax._src import dispatch
 from jax._src import effects
 
 ResultMetadata = DuckTypedArray | core.AbstractToken
 
+KERNEL_TYPE_TO_CALL_TARGET: dict[str, str] = {
+    "ptx": "__gpu$xla.gpu.ptx",
+}
+SUPPORTED_KERNEL_TYPES: list[str] = list(KERNEL_TYPE_TO_CALL_TARGET.keys())
 
 def _result_avals(results: Sequence[ResultMetadata]) -> tuple[core.AbstractValue, ...]:
   avals: list[core.AbstractValue] = []
@@ -38,18 +42,18 @@ def _result_avals(results: Sequence[ResultMetadata]) -> tuple[core.AbstractValue
 class HashableArray:
   __slots__ = ["val"]
 
-  def __init__(self, val):
+  def __init__(self, val: np.ndarray):
     assert isinstance(val, np.ndarray)
     self.val = np.copy(val)
     self.val.setflags(write=False)
 
-  def __repr__(self):
+  def __repr__(self) -> str:
     return f"HashableArray({self.val})"
 
-  def __hash__(self):
+  def __hash__(self) -> int:
     return hash((self.val.shape, self.val.dtype, self.val.tobytes()))
 
-  def __eq__(self, other):
+  def __eq__(self, other) -> bool:
     return isinstance(other, HashableArray) and np.array_equal(self.val, other.val)
 
 
@@ -60,22 +64,16 @@ class HashableDict:
     assert isinstance(val, dict)
     self.val = tuple(sorted(val.items()))
 
-  def __repr__(self):
+  def __repr__(self) -> str:
     return f"HashableDict({dict(self.val)})"
 
-  def __hash__(self):
+  def __hash__(self) -> int:
     return hash(self.val)
 
-  def __eq__(self, other):
+  def __eq__(self, other) -> bool:
     return isinstance(other, HashableDict) and self.val == other.val
 
 
-
-# ffi_call must support some small non-hashable input arguments, like np.arrays
-# and dicts, to support calling FFI targets with array inputs or user defined
-# structs. Since these arguments will eventually be embedded in the HLO as
-# dense attributes, we assume that they are small and hash by making an
-# immutable copy and hashing by value.
 def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
   hashable_kwargs: dict[str, Any] = {}
   for k, v in kwargs.items():
@@ -88,18 +86,37 @@ def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
         hash(v)
       except TypeError as e:
         raise TypeError(
-            f"Non-hashable keyword argument to ffi_call {k}: {v}") from e
+            f"Non-hashable keyword argument to kernel_call {k}: {v}") from e
       else:
         hashable_kwargs[k] = v
   return hashable_kwargs
 
-def ptx_call(
-    ptx_code: str,
+
+def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], block_dims: int | tuple[int, ...] | list[int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+  if isinstance(grid_dims, int):
+    grid_dims = (grid_dims, 1, 1)
+  elif len(grid_dims) == 1:
+    grid_dims = (grid_dims[0], 1, 1)
+  elif len(grid_dims) == 2:
+    grid_dims = (*grid_dims, 1)
+
+  if isinstance(block_dims, int):
+    block_dims = (block_dims, 1, 1)
+  elif len(block_dims) == 1:
+    block_dims = (block_dims[0], 1, 1)
+  elif len(block_dims) == 2:
+    block_dims = (*block_dims, 1)
+
+  return grid_dims, block_dims
+
+def kernel_call(
+    kernel_content: str,
     kernel_name: str,
     result_shape_dtypes: ResultMetadata | Sequence[ResultMetadata],
     *args: ArrayLike,
-    grid_dims: tuple[int, int, int] = (1, 1, 1),
-    block_dims: tuple[int, int, int] = (256, 1, 1),
+    kernel_type: str = "ptx",
+    grid_dims: int | tuple[int, ...] | list[int] = (1, 1, 1),
+    block_dims: int | tuple[int, ...] | list[int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
     has_side_effect: bool = False,
     output_indices: Sequence[int] | None = None,
@@ -107,6 +124,37 @@ def ptx_call(
     vectorized: bool | DeprecatedArg = DeprecatedArg(),
     **kwargs: Any,
 ) -> Array | list[Array]:  # type: ignore
+    """Call a device kernel with the specified kernel type.
+    
+    Currently supported kernel types:
+    - ptx: NVIDIA PTX kernel code for CUDA GPUs
+    
+    Args:
+        kernel_content: Source code for the kernel
+        kernel_name: Name of the kernel function to call
+        result_shape_dtypes: Shape and dtype of the result(s)
+        *args: Input arrays
+        kernel_type: Type of kernel code (e.g., "ptx")
+        grid_dims: Grid dimensions for kernel launch
+        block_dims: Block dimensions for kernel launch
+        shared_mem_bytes: Bytes of shared memory to allocate
+        has_side_effect: Whether the kernel has side effects
+        output_indices: Indices of outputs in argument list
+        vmap_method: Method for vmapping the kernel
+        vectorized: Whether the kernel is vectorized
+        **kwargs: Additional arguments for specific kernel types
+        
+    Returns:
+        Result array(s) from kernel execution
+    """
+    # Validate kernel_type
+    if kernel_type not in SUPPORTED_KERNEL_TYPES:
+        raise ValueError(f"Unsupported kernel type: {kernel_type}. Supported types are: {SUPPORTED_KERNEL_TYPES}")
+
+    # Kernel-specific validation
+    if kernel_type == "ptx" and ".entry" not in kernel_content:
+        raise ValueError("PTX code must contain an .entry point")
+
     if isinstance(result_shape_dtypes, Sequence):
         multiple_results = True
         result_avals = _result_avals(result_shape_dtypes)
@@ -129,20 +177,8 @@ def ptx_call(
 
     output_indices = np.array([] if output_indices is None else output_indices)
 
-    # Normalize grid and block dims to 3D tuples
-    if isinstance(grid_dims, int):
-        grid_dims = (grid_dims, 1, 1)
-    elif len(grid_dims) == 1:
-        grid_dims = (grid_dims[0], 1, 1)
-    elif len(grid_dims) == 2:
-        grid_dims = (*grid_dims, 1)
-
-    if isinstance(block_dims, int):
-        block_dims = (block_dims, 1, 1)
-    elif len(block_dims) == 1:
-        block_dims = (block_dims[0], 1, 1)
-    elif len(block_dims) == 2:
-        block_dims = (*block_dims, 1)
+    grid_dims, block_dims = _normalize_grid_block_dims(grid_dims, block_dims)
+    call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
   
     kwargs = {
         "grid_x": grid_dims[0],
@@ -153,15 +189,17 @@ def ptx_call(
         "block_z": block_dims[2],
         "shared_mem_bytes": shared_mem_bytes,
         "output_indices": output_indices,
+        "call_target": call_target,
         **kwargs,
     }
-    results = ptx_call_p.bind(
+    
+    results = kernel_call_p.bind(
         *args,
         result_avals=result_avals,
         vectorized=vectorized,
         vmap_method=vmap_method,
         kernel_name=kernel_name,
-        ptx_code=ptx_code,
+        kernel_content=kernel_content,  
         has_side_effect=has_side_effect,
         **_wrap_kwargs_hashable(kwargs),
     )
@@ -219,9 +257,9 @@ def pycapsule(funcptr):
   return builder(funcptr, None, destructor(0))
 
 
-PtxLayoutOptions = Sequence[int] | DeviceLocalLayout | None
-def ptx_lowering(
-    ptx_code: str,
+KernelLayoutOptions = Sequence[int] | DeviceLocalLayout | None
+def kernel_lowering(
+    kernel_content: str,
     kernel_name: str,
     grid_x: int,
     grid_y: int,
@@ -230,7 +268,9 @@ def ptx_lowering(
     block_y: int,
     block_z: int,
     shared_mem_bytes: int,
+    call_target: str,
     output_indices: Sequence[int] | None = None,
+    has_side_effect: bool = False,
     **lowering_args: Any
 ) -> mlir.LoweringRule:
     def _lowering(
@@ -247,7 +287,7 @@ def ptx_lowering(
 
         backend_config = {
             "name": kernel_name,
-            "source": ptx_code,
+            "source": kernel_content,
             "grid_x": grid_x,
             "grid_y": grid_y,
             "grid_z": grid_z,
@@ -273,54 +313,64 @@ def ptx_lowering(
                 for aval in ctx.avals_out
             ]
 
+        if has_side_effect:
+            kwargs["has_side_effect"] = True
+
         return mlir.custom_call(
-            "__gpu$xla.gpu.ptx",
+            call_target,
             operands=operands,
             result_types=result_types,
-            backend_config=backend_config
+            backend_config=backend_config,
+            has_side_effect=has_side_effect
         ).results
 
     return _lowering
 
-class PtxEffect(effects.Effect):
+class KernelEffect(effects.Effect):
   def __str__(self):
-    return "PTX"
+    return "Kernel"
 
-_PtxEffect = PtxEffect()
-effects.lowerable_effects.add_type(PtxEffect)
-effects.control_flow_allowed_effects.add_type(PtxEffect)
+_KernelEffect = KernelEffect()
+effects.lowerable_effects.add_type(KernelEffect)
+effects.control_flow_allowed_effects.add_type(KernelEffect)
 
-
-
-def ptx_call_abstract_eval(
+def kernel_call_abstract_eval(
     *avals_in,
     result_avals: tuple[core.AbstractValue, ...],
-    ptx_code: str,
+    kernel_content: str,
     kernel_name: str,
     vectorized: bool | DeprecatedArg,
     vmap_method: str | None,
     has_side_effect: bool,
     **kwargs: Any,
 ):
-    del avals_in, kernel_name, ptx_code, vectorized, vmap_method, kwargs
-    effects = core.no_effects
+    del avals_in, kernel_name, kernel_content, vectorized, vmap_method, kwargs
+    if has_side_effect:
+        effects = {_KernelEffect}  # Use the defined KernelEffect when has_side_effect is True
+    else:
+        effects = core.no_effects
     return result_avals, effects
 
 
-def ptx_call_lowering(
+def kernel_call_lowering(
     ctx: mlir.LoweringRuleContext,
     *operands: ir.Value,
     result_avals: tuple[core.AbstractValue, ...],
     kernel_name: str,
-    ptx_code: str,
+    kernel_content: str,
     vectorized: bool | DeprecatedArg,
     vmap_method: str | None,
     has_side_effect: bool,
     **kwargs: Any,
 ) -> Sequence[ir.Value]:
     del result_avals, vectorized, vmap_method
-    rule = ptx_lowering(
-        ptx_code,
+    
+    call_target = kwargs.get("call_target")
+    if call_target is None:
+        raise ValueError("call_target must be provided")
+    
+    rule = kernel_lowering(
+        kernel_content,
         kernel_name,
         kwargs["grid_x"],
         kwargs["grid_y"], 
@@ -329,18 +379,16 @@ def ptx_call_lowering(
         kwargs["block_y"],
         kwargs["block_z"],
         kwargs["shared_mem_bytes"],
+        call_target,
         kwargs["output_indices"],
+        has_side_effect=has_side_effect,
     )
+    
     return rule(ctx, *operands, **_unwrap_kwargs_hashable(kwargs))
 
-ptx_call_p = core.Primitive("ptx_call")
-ptx_call_p.multiple_results = True
-dispatch.simple_impl(ptx_call_p)
-ptx_call_p.def_effectful_abstract_eval(ptx_call_abstract_eval)
-# ffi_call_p.def_effectful_abstract_eval(ffi_call_abstract_eval)
-# ad.primitive_jvps[ffi_call_p] = ffi_call_jvp
-# ad.primitive_transposes[ffi_call_p] = ffi_call_transpose
-# batching.primitive_batchers[ffi_call_p] = functools.partial(
-#     callback_batching_rule, ffi_call_p)
-mlir.register_lowering(ptx_call_p, ptx_call_lowering)
+kernel_call_p = core.Primitive("kernel_call")
+kernel_call_p.multiple_results = True
+dispatch.simple_impl(kernel_call_p)
+kernel_call_p.def_effectful_abstract_eval(kernel_call_abstract_eval)
+mlir.register_lowering(kernel_call_p, kernel_call_lowering)
 
