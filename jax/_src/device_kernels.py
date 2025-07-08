@@ -1,3 +1,18 @@
+# Copyright 2025 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import ctypes
 
 from jax._src import core
@@ -9,7 +24,7 @@ from jax._src.interpreters import mlir
 
 from jax._src.lib.mlir import ir
 
-from jax._src.layout import DeviceLocalLayout
+from jax._src.layout import Layout
 
 import numpy as np
 
@@ -20,77 +35,30 @@ from collections.abc import Sequence
 from jax._src import dispatch
 from jax._src import effects
 
+# Import existing implementations from ffi.py
+from jax._src.ffi import (
+    _result_avals, HashableDict, _aval_shape
+)
+from jax._src.hashable_array import HashableArray
+
+# Create wrapper functions to maintain dict interface
+def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
+  """Wrapper to maintain dict interface while using ffi implementation."""
+  from jax._src.ffi import _wrap_kwargs_hashable as ffi_wrap
+  wrapped = ffi_wrap(kwargs)
+  return dict(wrapped)
+
+def _unwrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
+  """Wrapper to maintain dict interface while using ffi implementation."""
+  from jax._src.ffi import _unwrap_kwargs_hashable as ffi_unwrap
+  return ffi_unwrap(tuple(kwargs.items()))
+
 ResultMetadata = DuckTypedArray | core.AbstractToken
 
 KERNEL_TYPE_TO_CALL_TARGET: dict[str, str] = {
     "ptx": "__gpu$xla.gpu.ptx",
 }
 SUPPORTED_KERNEL_TYPES: list[str] = list(KERNEL_TYPE_TO_CALL_TARGET.keys())
-
-def _result_avals(results: Sequence[ResultMetadata]) -> tuple[core.AbstractValue, ...]:
-  avals: list[core.AbstractValue] = []
-  for result in results:
-    if isinstance(result, core.AbstractToken):
-      avals.append(result)
-    else:
-      _check_shape_dtype(result)
-      avals.append(core.ShapedArray(result.shape, result.dtype))
-  return tuple(avals)
-
-
-
-class HashableArray:
-  __slots__ = ["val"]
-
-  def __init__(self, val: np.ndarray):
-    assert isinstance(val, np.ndarray)
-    self.val = np.copy(val)
-    self.val.setflags(write=False)
-
-  def __repr__(self) -> str:
-    return f"HashableArray({self.val})"
-
-  def __hash__(self) -> int:
-    return hash((self.val.shape, self.val.dtype, self.val.tobytes()))
-
-  def __eq__(self, other) -> bool:
-    return isinstance(other, HashableArray) and np.array_equal(self.val, other.val)
-
-
-class HashableDict:
-  __slots__ = ["val"]
-
-  def __init__(self, val):
-    assert isinstance(val, dict)
-    self.val = tuple(sorted(val.items()))
-
-  def __repr__(self) -> str:
-    return f"HashableDict({dict(self.val)})"
-
-  def __hash__(self) -> int:
-    return hash(self.val)
-
-  def __eq__(self, other) -> bool:
-    return isinstance(other, HashableDict) and self.val == other.val
-
-
-def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
-  hashable_kwargs: dict[str, Any] = {}
-  for k, v in kwargs.items():
-    if isinstance(v, np.ndarray):
-      hashable_kwargs[k] = HashableArray(v)
-    elif isinstance(v, dict):
-      hashable_kwargs[k] = HashableDict(v)
-    else:
-      try:
-        hash(v)
-      except TypeError as e:
-        raise TypeError(
-            f"Non-hashable keyword argument to kernel_call {k}: {v}") from e
-      else:
-        hashable_kwargs[k] = v
-  return hashable_kwargs
-
 
 def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], block_dims: int | tuple[int, ...] | list[int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
   if isinstance(grid_dims, int):
@@ -99,6 +67,8 @@ def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], blo
     grid_dims = (grid_dims[0], 1, 1)
   elif len(grid_dims) == 2:
     grid_dims = (*grid_dims, 1)
+  else:
+    raise ValueError(f"Invalid grid dimensions: {grid_dims}")
 
   if isinstance(block_dims, int):
     block_dims = (block_dims, 1, 1)
@@ -106,6 +76,8 @@ def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], blo
     block_dims = (block_dims[0], 1, 1)
   elif len(block_dims) == 2:
     block_dims = (*block_dims, 1)
+  else:
+    raise ValueError(f"Invalid block dimensions: {block_dims}")
 
   return grid_dims, block_dims
 
@@ -180,7 +152,7 @@ def kernel_call(
     grid_dims, block_dims = _normalize_grid_block_dims(grid_dims, block_dims)
     call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
   
-    kwargs = {
+    kernel_kwargs = {
         "grid_x": grid_dims[0],
         "grid_y": grid_dims[1],
         "grid_z": grid_dims[2],
@@ -201,63 +173,10 @@ def kernel_call(
         kernel_name=kernel_name,
         kernel_content=kernel_content,  
         has_side_effect=has_side_effect,
-        **_wrap_kwargs_hashable(kwargs),
+        **_wrap_kwargs_hashable(kernel_kwargs),
     )
     return results if multiple_results else results[0]
 
-def _unwrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
-  unwrapped_kwargs: dict[str, Any] = {}
-  for k, v in kwargs.items():
-    if isinstance(v, HashableArray):
-      unwrapped_kwargs[k] = v.val
-    elif isinstance(v, HashableDict):
-      unwrapped_kwargs[k] = dict(v.val)
-    else:
-      unwrapped_kwargs[k] = v
-  return unwrapped_kwargs
-
-def _aval_shape(aval: core.AbstractValue) -> Shape:
-  return () if aval is core.abstract_token else aval.shape  # pytype: disable=attribute-error
-
-def _convert_layout(aval: core.AbstractValue) -> Sequence[int]:
-  """Convert a layout to the minor-to-major order used by the custom call API."""
-  return list(reversed(range(len(_aval_shape(aval)))))
-
-def pycapsule(funcptr):
-  """Wrap a ctypes function pointer in a PyCapsule.
-
-  The primary use of this function, and the reason why it lives with in the
-  ``jax.extend.ffi`` submodule, is to wrap function calls from external
-  compiled libraries to be registered as XLA custom calls.
-
-  Example usage::
-
-    import ctypes
-    import jax
-    from jax.lib import xla_client
-
-    libfoo = ctypes.cdll.LoadLibrary('./foo.so')
-    xla_client.register_custom_call_target(
-        name="bar",
-        fn=jax.extend.ffi.pycapsule(libfoo.bar),
-        platform=PLATFORM,
-        api_version=API_VERSION
-    )
-
-  Args:
-    funcptr: A function pointer loaded from a dynamic library using ``ctypes``.
-
-  Returns:
-    An opaque ``PyCapsule`` object wrapping ``funcptr``.
-  """
-  destructor = ctypes.CFUNCTYPE(None, ctypes.py_object)
-  builder = ctypes.pythonapi.PyCapsule_New
-  builder.restype = ctypes.py_object
-  builder.argtypes = (ctypes.c_void_p, ctypes.c_char_p, destructor)
-  return builder(funcptr, None, destructor(0))
-
-
-KernelLayoutOptions = Sequence[int] | DeviceLocalLayout | None
 def kernel_lowering(
     kernel_content: str,
     kernel_name: str,
@@ -282,8 +201,10 @@ def kernel_lowering(
         
         if isinstance(output_indices, HashableArray):
             output_indices_val = list(output_indices.val)
-        else:
+        elif output_indices is not None:
             output_indices_val = list(output_indices)
+        else:
+            output_indices_val = []
 
         backend_config = {
             "name": kernel_name,
@@ -303,7 +224,7 @@ def kernel_lowering(
         result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
 
         if "result_types" not in kwargs:
-            kwargs["result_types"] = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
+            kwargs["result_types"] = result_types
 
         if "result_shapes" not in kwargs and not all(
             core.is_constant_shape(_aval_shape(aval)) for aval in ctx.avals_out
@@ -384,7 +305,7 @@ def kernel_call_lowering(
         has_side_effect=has_side_effect,
     )
     
-    return rule(ctx, *operands, **_unwrap_kwargs_hashable(kwargs))
+    return rule(ctx, *operands)
 
 kernel_call_p = core.Primitive("kernel_call")
 kernel_call_p.multiple_results = True
