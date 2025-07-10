@@ -34,12 +34,18 @@ from collections.abc import Sequence
 
 from jax._src import dispatch
 from jax._src import effects
+from jax._src import util
 
 # Import existing implementations from ffi.py
 from jax._src.ffi import (
     _result_avals, HashableDict, _aval_shape
 )
 from jax._src.hashable_array import HashableArray
+
+# Import interpreters for vmap support
+from jax._src.interpreters import ad
+from jax._src.interpreters import batching
+import functools
 
 # Create wrapper functions to maintain dict interface
 def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +88,7 @@ def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], blo
   return grid_dims, block_dims
 
 def kernel_call(
-    kernel_content: str,
+    kernel_data: str,
     kernel_name: str,
     result_shape_dtypes: ResultMetadata | Sequence[ResultMetadata],
     *args: ArrayLike,
@@ -102,7 +108,7 @@ def kernel_call(
     - ptx: NVIDIA PTX kernel code for CUDA GPUs
     
     Args:
-        kernel_content: Source code for the kernel
+        kernel_data: Source code for the kernel
         kernel_name: Name of the kernel function to call
         result_shape_dtypes: Shape and dtype of the result(s)
         *args: Input arrays
@@ -124,7 +130,7 @@ def kernel_call(
         raise ValueError(f"Unsupported kernel type: {kernel_type}. Supported types are: {SUPPORTED_KERNEL_TYPES}")
 
     # Kernel-specific validation
-    if kernel_type == "ptx" and ".entry" not in kernel_content:
+    if kernel_type == "ptx" and ".entry" not in kernel_data:
         raise ValueError("PTX code must contain an .entry point")
 
     if isinstance(result_shape_dtypes, Sequence):
@@ -147,7 +153,7 @@ def kernel_call(
                 f"Output indices must be integers in range [0, {len(args)}), got {output_indices}"
             )
 
-    output_indices = np.array([] if output_indices is None else output_indices)
+    output_indices = [] if output_indices is None else list(output_indices)
 
     grid_dims, block_dims = _normalize_grid_block_dims(grid_dims, block_dims)
     call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
@@ -171,14 +177,14 @@ def kernel_call(
         vectorized=vectorized,
         vmap_method=vmap_method,
         kernel_name=kernel_name,
-        kernel_content=kernel_content,  
+        kernel_data=kernel_data,  
         has_side_effect=has_side_effect,
         **_wrap_kwargs_hashable(kernel_kwargs),
     )
     return results if multiple_results else results[0]
 
 def kernel_lowering(
-    kernel_content: str,
+    kernel_data: str,
     kernel_name: str,
     grid_x: int,
     grid_y: int,
@@ -197,8 +203,6 @@ def kernel_lowering(
         *operands: ir.Value, 
         **params: Any
     ) -> Sequence[ir.Value | Sequence[ir.Value]]:
-        kwargs = {"api_version": 4}
-        
         if isinstance(output_indices, HashableArray):
             output_indices_val = list(output_indices.val)
         elif output_indices is not None:
@@ -208,7 +212,8 @@ def kernel_lowering(
 
         backend_config = {
             "name": kernel_name,
-            "source": kernel_content,
+            "kernel_data": kernel_data,
+            "kernel_type": "ptx",
             "grid_x": grid_x,
             "grid_y": grid_y,
             "grid_z": grid_z,
@@ -223,26 +228,13 @@ def kernel_lowering(
 
         result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
 
-        if "result_types" not in kwargs:
-            kwargs["result_types"] = result_types
-
-        if "result_shapes" not in kwargs and not all(
-            core.is_constant_shape(_aval_shape(aval)) for aval in ctx.avals_out
-        ):
-            kwargs["result_shapes"] = [
-                mlir.shape_tensor(mlir.eval_dynamic_shape_as_ivals(ctx, _aval_shape(aval)))
-                for aval in ctx.avals_out
-            ]
-
-        if has_side_effect:
-            kwargs["has_side_effect"] = True
-
         return mlir.custom_call(
             call_target,
             operands=operands,
             result_types=result_types,
             backend_config=backend_config,
-            has_side_effect=has_side_effect
+            has_side_effect=has_side_effect,
+            api_version=4,
         ).results
 
     return _lowering
@@ -258,14 +250,14 @@ effects.control_flow_allowed_effects.add_type(KernelEffect)
 def kernel_call_abstract_eval(
     *avals_in,
     result_avals: tuple[core.AbstractValue, ...],
-    kernel_content: str,
+    kernel_data: str,
     kernel_name: str,
     vectorized: bool | DeprecatedArg,
     vmap_method: str | None,
     has_side_effect: bool,
     **kwargs: Any,
 ):
-    del avals_in, kernel_name, kernel_content, vectorized, vmap_method, kwargs
+    del avals_in, kernel_name, kernel_data, vectorized, vmap_method, kwargs
     if has_side_effect:
         effects = {_KernelEffect}  # Use the defined KernelEffect when has_side_effect is True
     else:
@@ -273,12 +265,87 @@ def kernel_call_abstract_eval(
     return result_avals, effects
 
 
+def kernel_call_jvp(*args, kernel_name, **_):
+    del args
+    raise ValueError(
+        f"The kernel call to `{kernel_name}` cannot be differentiated. "
+        "You can use `jax.custom_jvp` or `jax.custom_vjp` to add support.")
+
+
+def kernel_call_transpose(*args, kernel_name, **_):
+    del args
+    raise ValueError(
+        f"The kernel call to `{kernel_name}` cannot be differentiated. "
+        "You can use `jax.custom_jvp` or `jax.custom_vjp` to add support.")
+
+
+def kernel_call_batching_rule(
+    prim,
+    args,
+    dims,
+    *,
+    vmap_method: str | None,
+    result_avals: Sequence[core.ShapedArray],
+    **kwargs: Any,
+):
+    from jax._src.lax import control_flow  # pytype: disable=import-error
+    from jax._src.lax import lax  # pytype: disable=import-error
+
+    axis_size, = {a.shape[d] for a, d in zip(args, dims)
+                  if d is not batching.not_mapped}
+    new_args = [arg if dim is batching.not_mapped else
+                batching.moveaxis(arg, dim, 0) for arg, dim in zip(args, dims)]
+    batched_result_avals = tuple(
+        core.unmapped_aval(axis_size, 0, aval) for aval in result_avals)
+
+    if vmap_method == "legacy_vectorized":
+        # This method is kept to support the behavior that was previously exposed
+        # when using `vectorized=True`.
+        outvals = prim.bind(
+            *new_args,
+            vmap_method=vmap_method,
+            result_avals=batched_result_avals,
+            **kwargs,
+        )
+    elif vmap_method == "expand_dims" or vmap_method == "broadcast_all":
+        size = axis_size if vmap_method == "broadcast_all" else 1
+        bcast_args = [
+            lax.broadcast(x, (size,)) if d is batching.not_mapped else x
+            for x, d in zip(new_args, dims)]
+        outvals = prim.bind(
+          *bcast_args,
+          vmap_method=vmap_method,
+          result_avals=batched_result_avals,
+          **kwargs,
+        )
+    elif vmap_method == "sequential" or vmap_method == "sequential_unrolled":
+        is_batched = [d is not batching.not_mapped for d in dims]
+        unbatched_args, batched_args = util.partition_list(is_batched, new_args)
+        def _batch_fun(batched_args):
+          merged_args = util.merge_lists(is_batched, unbatched_args, batched_args)
+          return prim.bind(
+              *merged_args,
+              result_avals=result_avals,
+              vmap_method=vmap_method,
+              **kwargs,
+          )
+        unroll = vmap_method == "sequential_unrolled"
+        g = lambda _, x: ((), _batch_fun(x))
+        _, outvals = control_flow.scan(g, (), batched_args, unroll=unroll)
+    else:
+        raise NotImplementedError(
+            f"vmap is only supported for the {prim.name} primitive when vmap_method "
+            "is one of 'sequential', 'sequential_unrolled', 'expand_dims', "
+            f"'broadcast_all', or 'legacy_vectorized'. Got {vmap_method=}.")
+    return tuple(outvals), (0,) * len(outvals)
+
+
 def kernel_call_lowering(
     ctx: mlir.LoweringRuleContext,
     *operands: ir.Value,
     result_avals: tuple[core.AbstractValue, ...],
     kernel_name: str,
-    kernel_content: str,
+    kernel_data: str,
     vectorized: bool | DeprecatedArg,
     vmap_method: str | None,
     has_side_effect: bool,
@@ -291,7 +358,7 @@ def kernel_call_lowering(
         raise ValueError("call_target must be provided")
     
     rule = kernel_lowering(
-        kernel_content,
+        kernel_data,
         kernel_name,
         kwargs["grid_x"],
         kwargs["grid_y"], 
@@ -311,5 +378,9 @@ kernel_call_p = core.Primitive("kernel_call")
 kernel_call_p.multiple_results = True
 dispatch.simple_impl(kernel_call_p)
 kernel_call_p.def_effectful_abstract_eval(kernel_call_abstract_eval)
+ad.primitive_jvps[kernel_call_p] = kernel_call_jvp
+ad.primitive_transposes[kernel_call_p] = kernel_call_transpose
+batching.primitive_batchers[kernel_call_p] = functools.partial(
+    kernel_call_batching_rule, kernel_call_p)
 mlir.register_lowering(kernel_call_p, kernel_call_lowering)
 
