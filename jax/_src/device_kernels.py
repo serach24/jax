@@ -13,8 +13,6 @@
 # limitations under the License.
 
 
-import ctypes
-
 from jax._src import core
 from jax._src.typing import (Array, ArrayLike, DeprecatedArg, DuckTypedArray,
                              Shape)
@@ -28,7 +26,7 @@ from jax._src.layout import Layout
 
 import numpy as np
 
-from typing import Any
+from typing import Any, Callable
 
 from collections.abc import Sequence
 
@@ -38,7 +36,7 @@ from jax._src import util
 
 # Import existing implementations from ffi.py
 from jax._src.ffi import (
-    _result_avals, HashableDict, _aval_shape
+    _result_avals, _convert_layout_for_lowering
 )
 from jax._src.hashable_array import HashableArray
 
@@ -46,6 +44,17 @@ from jax._src.hashable_array import HashableArray
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 import functools
+
+# Import for batch partitioning support
+from jax._src.lib import xla_client
+from jax._src import xla_bridge
+
+# Import for sharding rule support
+from jax._src.custom_partitioning_sharding_rule import (
+    SdyShardingRule, str_to_sdy_sharding_rule
+)
+
+map, unsafe_map = util.safe_map, map
 
 # Create wrapper functions to maintain dict interface
 def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -66,6 +75,181 @@ KERNEL_TYPE_TO_CALL_TARGET: dict[str, str] = {
 }
 SUPPORTED_KERNEL_TYPES: list[str] = list(KERNEL_TYPE_TO_CALL_TARGET.keys())
 
+def register_device_kernel_as_batch_partitionable(kernel_type: str) -> None:
+  """Registers a device kernel type as batch partitionable.
+  
+  This allows the kernel to be automatically partitioned across leading dimensions
+  without requiring custom partitioning logic. The kernel will be executed
+  independently on each shard of data.
+  
+  Args:
+    kernel_type: The kernel type to register (e.g., "ptx")
+  """
+  if kernel_type not in SUPPORTED_KERNEL_TYPES:
+    raise ValueError(f"Unsupported kernel type: {kernel_type}. Supported types are: {SUPPORTED_KERNEL_TYPES}")
+  
+  call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
+  xla_client.register_custom_call_as_batch_partitionable(call_target)
+  xla_bridge.register_plugin_callbacks(
+      functools.partial(xla_client.register_custom_call_as_batch_partitionable,
+                        call_target))
+
+# Register PTX kernels as batch partitionable by default
+register_device_kernel_as_batch_partitionable("ptx")
+
+def build_device_kernel_lowering_function(
+    kernel_data: str,
+    kernel_name: str,
+    call_target: str,
+    *,
+    grid_dims: tuple[int, ...] = (1, 1, 1),
+    block_dims: tuple[int, ...] = (256, 1, 1),
+    shared_mem_bytes: int = 0,
+    output_indices: Sequence[int] | None = None,
+    has_side_effect: bool = False,
+    operand_layouts: Sequence[Sequence[int]] | None = None,
+    result_layouts: Sequence[Sequence[int]] | None = None,
+    **lowering_args: Any,
+) -> Callable[..., ir.Operation]:
+  """Build a lowering op for a device kernel.
+
+  By default, this lowering rule can use the input and output abstract values to
+  compute the input and output types and shapes for the custom call, assuming
+  row-major layouts.
+
+  Note that layouts passed to this function should be in minor-to-major order
+  (as expected by XLA).
+
+  Args:
+    kernel_data: Source code for the kernel
+    kernel_name: Name of the kernel function to call
+    call_target: The name of the custom call target
+    grid_dims: Grid dimensions for kernel launch
+    block_dims: Block dimensions for kernel launch
+    shared_mem_bytes: Bytes of shared memory to allocate
+    output_indices: Indices of outputs in argument list
+    has_side_effect: Whether the kernel has side effects
+    operand_layouts: A sequence of layouts (dimension orders) for each operand.
+      By default, the operands are assumed to be row-major.
+    result_layouts: A sequence of layouts (dimension orders) for each result.
+      By default, the results are assumed to be row-major.
+    lowering_args: Any other arguments to :func:`mlir.custom_call` will also be
+      passed through if provided as extra arguments to this function.
+  """
+
+  def _lowering_op(
+    ctx: mlir.LoweringRuleContext, *operands: ir.Value, **params: Any
+  ) -> ir.Operation:
+    if isinstance(output_indices, HashableArray):
+        output_indices_val = list(output_indices.val)
+    elif output_indices is not None:
+        output_indices_val = list(output_indices)
+    else:
+        output_indices_val = []
+
+    backend_config = {
+        "name": kernel_name,
+        "kernel_data": kernel_data,
+        "kernel_type": "ptx",
+        "grid_x": grid_dims[0],
+        "grid_y": grid_dims[1],
+        "grid_z": grid_dims[2],
+        "block_x": block_dims[0],
+        "block_y": block_dims[1],
+        "block_z": block_dims[2],
+        "shared_mem_bytes": shared_mem_bytes,
+        "output_indices": output_indices_val,
+    }
+    
+    backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
+
+    kwargs = dict(lowering_args)
+    kwargs.setdefault("api_version", 4)
+    kwargs["backend_config"] = backend_config
+    kwargs["has_side_effect"] = has_side_effect
+    
+    if "result_types" not in kwargs:
+      kwargs["result_types"] = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
+    
+    if operand_layouts is None:
+      kwargs["operand_layouts"] = map(_convert_layout_for_lowering, ctx.avals_in)
+    else:
+      kwargs["operand_layouts"] = [
+          _convert_layout_for_lowering(*args)
+          for args in zip(ctx.avals_in, operand_layouts)]
+    
+    if result_layouts is None:
+      kwargs["result_layouts"] = map(_convert_layout_for_lowering, ctx.avals_out)
+    else:
+      kwargs["result_layouts"] = [
+          _convert_layout_for_lowering(*args)
+          for args in zip(ctx.avals_out, result_layouts)]
+
+    return mlir.custom_call(call_target, operands=operands, **kwargs)
+
+  return _lowering_op
+
+def kernel_lowering(
+    kernel_data: str,
+    kernel_name: str,
+    call_target: str,
+    *,
+    grid_dims: tuple[int, ...] = (1, 1, 1),
+    block_dims: tuple[int, ...] = (256, 1, 1),
+    shared_mem_bytes: int = 0,
+    output_indices: Sequence[int] | None = None,
+    has_side_effect: bool = False,
+    operand_layouts: Sequence[Sequence[int]] | None = None,
+    result_layouts: Sequence[Sequence[int]] | None = None,
+    **lowering_args: Any
+) -> mlir.LoweringRule:
+  """Build a lowering rule for a device kernel.
+
+  By default, this lowering rule can use the input and output abstract values to
+  compute the input and output types and shapes for the custom call, assuming
+  row-major layouts.
+
+  Note that layouts passed to this function should be in minor-to-major order
+  (as expected by XLA).
+
+  Args:
+    kernel_data: Source code for the kernel
+    kernel_name: Name of the kernel function to call
+    call_target: The name of the custom call target
+    grid_dims: Grid dimensions for kernel launch
+    block_dims: Block dimensions for kernel launch
+    shared_mem_bytes: Bytes of shared memory to allocate
+    output_indices: Indices of outputs in argument list
+    has_side_effect: Whether the kernel has side effects
+    operand_layouts: A sequence of layouts (dimension orders) for each operand.
+      By default, the operands are assumed to be row-major.
+    result_layouts: A sequence of layouts (dimension orders) for each result.
+      By default, the results are assumed to be row-major.
+    lowering_args: Any other arguments to :func:`mlir.custom_call` will also be
+      passed through if provided as extra arguments to this function.
+  """
+
+  def _lowering(
+    ctx: mlir.LoweringRuleContext, *operands: ir.Value, **params: Any
+  ) -> Sequence[ir.Value | Sequence[ir.Value]]:
+    result = build_device_kernel_lowering_function(
+        kernel_data,
+        kernel_name,
+        call_target,
+        grid_dims=grid_dims,
+        block_dims=block_dims,
+        shared_mem_bytes=shared_mem_bytes,
+        output_indices=output_indices,
+        has_side_effect=has_side_effect,
+        operand_layouts=operand_layouts,
+        result_layouts=result_layouts,
+        **lowering_args,
+    )(ctx, *operands, **params)
+
+    return result.results  # type: ignore
+
+  return _lowering
+
 def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], block_dims: int | tuple[int, ...] | list[int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
   if isinstance(grid_dims, int):
     grid_dims = (grid_dims, 1, 1)
@@ -73,8 +257,6 @@ def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], blo
     grid_dims = (grid_dims[0], 1, 1)
   elif len(grid_dims) == 2:
     grid_dims = (*grid_dims, 1)
-  else:
-    raise ValueError(f"Invalid grid dimensions: {grid_dims}")
 
   if isinstance(block_dims, int):
     block_dims = (block_dims, 1, 1)
@@ -82,10 +264,8 @@ def _normalize_grid_block_dims(grid_dims: int | tuple[int, ...] | list[int], blo
     block_dims = (block_dims[0], 1, 1)
   elif len(block_dims) == 2:
     block_dims = (*block_dims, 1)
-  else:
-    raise ValueError(f"Invalid block dimensions: {block_dims}")
 
-  return grid_dims, block_dims
+  return tuple(grid_dims), tuple(block_dims)
 
 def kernel_call(
     kernel_data: str,
@@ -153,7 +333,7 @@ def kernel_call(
                 f"Output indices must be integers in range [0, {len(args)}), got {output_indices}"
             )
 
-    output_indices = [] if output_indices is None else list(output_indices)
+    output_indices = () if output_indices is None else tuple(output_indices)
 
     grid_dims, block_dims = _normalize_grid_block_dims(grid_dims, block_dims)
     call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
@@ -183,61 +363,88 @@ def kernel_call(
     )
     return results if multiple_results else results[0]
 
-def kernel_lowering(
+def device_kernel_custom_partitioning(
     kernel_data: str,
     kernel_name: str,
-    grid_x: int,
-    grid_y: int,
-    grid_z: int,
-    block_x: int,
-    block_y: int,
-    block_z: int,
-    shared_mem_bytes: int,
-    call_target: str,
-    output_indices: Sequence[int] | None = None,
+    kernel_type: str = "ptx",
+    grid_dims: int | tuple[int, ...] | list[int] = (1, 1, 1),
+    block_dims: int | tuple[int, ...] | list[int] = (256, 1, 1),
+    shared_mem_bytes: int = 0,
     has_side_effect: bool = False,
-    **lowering_args: Any
-) -> mlir.LoweringRule:
-    def _lowering(
-        ctx: mlir.LoweringRuleContext, 
-        *operands: ir.Value, 
-        **params: Any
-    ) -> Sequence[ir.Value | Sequence[ir.Value]]:
-        if isinstance(output_indices, HashableArray):
-            output_indices_val = list(output_indices.val)
-        elif output_indices is not None:
-            output_indices_val = list(output_indices)
-        else:
-            output_indices_val = []
-
-        backend_config = {
-            "name": kernel_name,
-            "kernel_data": kernel_data,
-            "kernel_type": "ptx",
-            "grid_x": grid_x,
-            "grid_y": grid_y,
-            "grid_z": grid_z,
-            "block_x": block_x,
-            "block_y": block_y,
-            "block_z": block_z,
-            "shared_mem_bytes": shared_mem_bytes,
-            "output_indices": output_indices_val,
-        }
+    output_indices: Sequence[int] | None = None,
+    vmap_method: str | None = None,
+    vectorized: bool | DeprecatedArg = DeprecatedArg(),
+):
+  """Decorator for creating device kernels with custom partitioning support.
+  
+  This decorator allows you to define custom partitioning strategies for device kernels,
+  similar to how `custom_partitioning` works for general JAX operations.
+  
+  Args:
+    kernel_data: Source code for the kernel
+    kernel_name: Name of the kernel function to call
+    kernel_type: Type of kernel code (e.g., "ptx")
+    grid_dims: Grid dimensions for kernel launch
+    block_dims: Block dimensions for kernel launch
+    shared_mem_bytes: Bytes of shared memory to allocate
+    has_side_effect: Whether the kernel has side effects
+    output_indices: Indices of outputs in argument list
+    vmap_method: Method for vmapping the kernel
+    vectorized: Whether the kernel is vectorized
+    
+  Returns:
+    A decorator function that can be applied to a function to create a custom
+    partitioned device kernel.
+  """
+  def decorator(fun):
+    class DeviceKernelCustomPartitioning:
+      def __init__(self, fun):
+        self.fun = fun
+        self.partition = None
+        self.propagate_user_sharding = None
+        self.infer_sharding_from_operands = None
+        self.sharding_rule = None
         
-        backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
-
-        result_types = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
-
-        return mlir.custom_call(
-            call_target,
-            operands=operands,
-            result_types=result_types,
-            backend_config=backend_config,
+      def def_partition(self, partition, infer_sharding_from_operands=None,
+                        propagate_user_sharding=None, decode_shardings=True,
+                        sharding_rule=None):
+        """Define custom partitioning strategy for the device kernel.
+        
+        Args:
+          partition: Callable that takes mesh, arg_shapes, result_shape and returns
+            mesh, lower_fn, result_sharding, arg_shardings
+          infer_sharding_from_operands: Callable that computes output sharding from input shardings
+          propagate_user_sharding: Callable that propagates user sharding
+          decode_shardings: Whether to decode shardings
+          sharding_rule: Sharding rule for the kernel
+        """
+        self.partition = partition
+        self.propagate_user_sharding = propagate_user_sharding
+        self.infer_sharding_from_operands = infer_sharding_from_operands
+        self.decode_shardings = decode_shardings
+        self.sharding_rule = sharding_rule
+        return partition
+        
+      def __call__(self, *args, **kwargs):
+        # Create the kernel call with the specified parameters
+        return kernel_call(
+            kernel_data=kernel_data,
+            kernel_name=kernel_name,
+            result_shape_dtypes=self.fun(*args, **kwargs),
+            *args,
+            kernel_type=kernel_type,
+            grid_dims=grid_dims,
+            block_dims=block_dims,
+            shared_mem_bytes=shared_mem_bytes,
             has_side_effect=has_side_effect,
-            api_version=4,
-        ).results
-
-    return _lowering
+            output_indices=output_indices,
+            vmap_method=vmap_method,
+            vectorized=vectorized,
+        )
+    
+    return DeviceKernelCustomPartitioning(fun)
+  
+  return decorator
 
 class KernelEffect(effects.Effect):
   def __str__(self):
@@ -360,16 +567,14 @@ def kernel_call_lowering(
     rule = kernel_lowering(
         kernel_data,
         kernel_name,
-        kwargs["grid_x"],
-        kwargs["grid_y"], 
-        kwargs["grid_z"],
-        kwargs["block_x"],
-        kwargs["block_y"],
-        kwargs["block_z"],
-        kwargs["shared_mem_bytes"],
         call_target,
-        kwargs["output_indices"],
+        grid_dims=(kwargs["grid_x"], kwargs["grid_y"], kwargs["grid_z"]),
+        block_dims=(kwargs["block_x"], kwargs["block_y"], kwargs["block_z"]),
+        shared_mem_bytes=kwargs["shared_mem_bytes"],
+        output_indices=kwargs["output_indices"],
         has_side_effect=has_side_effect,
+        operand_layouts=kwargs.get("operand_layouts"),
+        result_layouts=kwargs.get("result_layouts"),
     )
     
     return rule(ctx, *operands)
@@ -383,4 +588,3 @@ ad.primitive_transposes[kernel_call_p] = kernel_call_transpose
 batching.primitive_batchers[kernel_call_p] = functools.partial(
     kernel_call_batching_rule, kernel_call_p)
 mlir.register_lowering(kernel_call_p, kernel_call_lowering)
-

@@ -15,5 +15,4 @@
 from jax._src.device_kernels import (
     kernel_call as kernel_call,
     kernel_lowering as kernel_lowering,
-    pycapsule as pycapsule,
 )
