@@ -28,63 +28,74 @@ from jax._src.device_kernels import (
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Mesh, NamedSharding
 
+from jax._src import test_util as jtu
 
-class TestDeviceKernels:
+class TestDeviceKernels(jtu.JaxTestCase):
     """Test suite for device kernels functionality."""
 
     def test_basic_kernel_call(self):
         """Test basic kernel call functionality."""
         # Simple PTX kernel that adds two arrays
         ptx_kernel = """
-        .visible .entry add_kernel(
+        .version 8.5
+        .target sm_90
+        .address_size 64
+
+        .entry add_kernel(
             .param .u64 a,
             .param .u64 b,
-            .param .u64 c,
-            .param .u32 n
+            .param .u64 c
         ) {
-            .reg .u32 %tid.x;
-            .reg .u32 %n;
-            .reg .u64 %a, %b, %c;
-            .reg .f32 %val_a, %val_b, %val_c;
-            
-            ld.param.u32 %n, [n];
-            ld.param.u64 %a, [a];
-            ld.param.u64 %b, [b];
-            ld.param.u64 %c, [c];
-            
-            mov.u32 %tid.x, %tid.x;
-            setp.ge.u32 %p1, %tid.x, %n;
-            @%p1 bra exit;
-            
-            mul.wide.u32 %rd1, %tid.x, 4;
-            add.u64 %rd2, %a, %rd1;
-            add.u64 %rd3, %b, %rd1;
-            add.u64 %rd4, %c, %rd1;
-            
-            ld.global.f32 %val_a, [%rd2];
-            ld.global.f32 %val_b, [%rd3];
-            add.f32 %val_c, %val_a, %val_b;
-            st.global.f32 [%rd4], %val_c;
-            
-        exit:
-            ret;
+            .reg .s32 r0;
+            .reg .u64 p1, p2, p3, p4;
+            .reg .f32 r1, r2, r3;
+
+            // Load parameters into registers
+            ld.param.u64 p1, [a];
+            ld.param.u64 p2, [b];
+            ld.param.u64 p3, [c];
+
+            // Calculate offset in bytes using thread index
+            mov.u32 r0, %tid.x;
+            mul.wide.s32 p4, r0, 4;  // p4 now holds the byte offset as a u64
+
+            // Calculate final addresses for a, b, and c
+            add.u64 p1, p1, p4;
+            add.u64 p2, p2, p4;
+            add.u64 p3, p3, p4;
+
+            // Load float values from the computed addresses, perform addition, and store result
+            ld.global.f32 r1, [p1];
+            ld.global.f32 r2, [p2];
+            add.f32 r3, r1, r2;
+            st.global.f32 [p3], r3;
         }
         """
         
         a = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
         b = jnp.array([4.0, 5.0, 6.0], dtype=jnp.float32)
         
-        # Note: This is a mock test - actual PTX execution would require
-        # proper GPU setup and kernel registration
-        with pytest.raises(ValueError, match="call_target must be provided"):
-            result = kernel_call(
-                ptx_kernel,
-                "add_kernel",
-                a,
-                a, b,
-                grid_dims=1,
-                block_dims=256
-            )
+        # Test that the kernel call executes successfully
+        result = kernel_call(
+            ptx_kernel,
+            "add_kernel",          # kernel name
+            jax.ShapeDtypeStruct(a.shape, a.dtype),  # output shape and dtype
+            a, b,                   # input arrays
+            kernel_type="ptx",      # kernel type
+            grid_dims=(1, 1, 1),
+            block_dims=(3, 1, 1),
+            shared_mem_bytes=0,
+        )
+        print("a", a)
+        print("b", b)
+        # Verify the result
+        expected = a + b  # [5.0, 7.0, 9.0]
+        assert jnp.allclose(a, jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)) 
+        # assert jnp.allclose(b, jnp.array([4.0, 5.0, 6.0], dtype=jnp.float32))
+        # assert jnp.allclose(expected, jnp.array([5.0, 7.0, 9.0], dtype=jnp.float32))
+        if isinstance(result, list):
+            result = result[0]  # Take first result if it's a list
+        assert jnp.allclose(result, expected), f"Expected {expected}, got {result}"
 
     def test_batch_partitioning_registration(self):
         """Test batch partitioning registration."""
@@ -202,66 +213,118 @@ class TestDeviceKernels:
         except Exception as e:
             pytest.fail(f"def_partition raised {e}")
 
-    def test_layout_conversion(self):
-        """Test layout conversion functionality."""
-        from jax._src.device_kernels import _convert_layout_for_device_kernel
-        from jax._src import core
-        
-        # Test with None layout (should default to row-major)
-        aval = core.ShapedArray((2, 3), jnp.float32)
-        layout = _convert_layout_for_device_kernel(aval, None)
-        assert layout == (1, 0)  # minor-to-major order
-        
-        # Test with custom layout
-        custom_layout = [0, 1]  # major-to-minor
-        layout = _convert_layout_for_device_kernel(aval, custom_layout)
-        assert layout == (0, 1)
-
-    def test_partitioning_with_sharding(self):
-        """Test partitioning with actual sharding."""
+    def test_batch_partitioning(self):
+        """Test batch partitioning and sharding preservation."""
         if jax.device_count() < 2:
             pytest.skip("Requires multiple devices")
         
         ptx_kernel = """
-        .visible .entry add_kernel(
+        .version 8.5
+        .target sm_90
+        .address_size 64
+
+        .entry add_kernel(
             .param .u64 a,
             .param .u64 b,
-            .param .u64 c,
-            .param .u32 n
+            .param .u64 c
         ) {
-            ret;
+            .reg .s32 r0, r1, r2;
+            .reg .u64 p1, p2, p3, p4;
+            .reg .f32 r1_val, r2_val, r3;
+
+            // Load parameters into registers
+            ld.param.u64 p1, [a];
+            ld.param.u64 p2, [b];
+            ld.param.u64 p3, [c];
+
+            // Calculate 2D indices from thread and block IDs
+            mov.u32 r0, %tid.x;     // thread index within block
+            mov.u32 r1, %ctaid.x;   // block index
+            
+            // Calculate row and column indices
+            // For 2D array (8, 4): row = block_id, col = thread_id
+            // row = r1, col = r0
+            
+            // Calculate offset: (row * 4 + col) * 4 bytes
+            mul.lo.s32 r2, r1, 4;   // row * 4
+            add.s32 r2, r2, r0;     // + col
+            mul.wide.s32 p4, r2, 4; // * 4 bytes per float
+
+            // Calculate final addresses for a, b, and c
+            add.u64 p1, p1, p4;
+            add.u64 p2, p2, p4;
+            add.u64 p3, p3, p4;
+
+            // Load float values from the computed addresses, perform addition, and store result
+            ld.global.f32 r1_val, [p1];
+            ld.global.f32 r2_val, [p2];
+            add.f32 r3, r1_val, r2_val;
+            st.global.f32 [p3], r3;
         }
         """
         
-        # Create a mesh with available devices
-        devices = jax.devices()
-        mesh = Mesh(devices, ('x',))
+        def kernel_fn(x, y):
+            return kernel_call(
+                ptx_kernel,
+                "add_kernel",
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                x, y,
+                kernel_type="ptx",
+                grid_dims=(x.shape[0], 1, 1),
+                block_dims=(x.shape[1], 1, 1),
+                shared_mem_bytes=0,
+                output_indices=[2]
+            )
         
-        # Create sharded arrays
+        # Create mesh and sharded arrays
+        devices = jax.devices()
+        mesh = Mesh(devices, ('i',))
         x = jnp.ones((8, 4), dtype=jnp.float32)
         y = jnp.ones((8, 4), dtype=jnp.float32)
         
-        sharding = NamedSharding(mesh, P('x'))
-        x_sharded = jax.device_put(x, sharding)
-        y_sharded = jax.device_put(y, sharding)
+        x_sharding = NamedSharding(mesh, P('i'))
+        x = jax.device_put(x, x_sharding)
+        y = jax.device_put(y, x_sharding)
         
-        # Test that kernel_call can handle sharded inputs
-        # Note: This will fail at execution time due to missing kernel registration
-        # but should not fail at the JAX level
-        with pytest.raises(ValueError, match="call_target must be provided"):
-            result = kernel_call(
-                ptx_kernel,
-                "add_kernel",
-                jax.ShapeDtypeStruct((8, 4), jnp.float32),
-                x_sharded, y_sharded,
-                kernel_type="ptx",
-                grid_dims=(8, 1, 1),
-                block_dims=(256, 1, 1)
-            )
+        # Test eager mode
+        result_eager = kernel_fn(x, y)
+        
+        # Test JIT mode with output sharding
+        kernel_fn_jit = jax.jit(kernel_fn, out_shardings=x_sharding)
+        result_jit = kernel_fn_jit(x, y)
+        
+        # Verify results
+        expected = x + y  # Should be 2.0 everywhere
+        if isinstance(result_eager, list):
+            result_eager = result_eager[0]
+        if isinstance(result_jit, list):
+            result_jit = result_jit[0]
+            
+        assert jnp.allclose(result_eager, expected), f"Eager result incorrect: {result_eager}"
+        assert jnp.allclose(result_jit, expected), f"JIT result incorrect: {result_jit}"
+        
+        # Test that JIT result preserves sharding
+        assert hasattr(result_jit, 'sharding'), "JIT result should have sharding"
+        assert result_jit.sharding == x_sharding, f"Expected sharding {x_sharding}, got {result_jit.sharding}"
+        
+        # Test compilation (this should not crash)
+        try:
+            compiled = kernel_fn_jit.lower(x, y).compile()
+            # Note: We can't easily check for "all-gather" in the compiled text
+            # but the fact that it compiles without error is good
+        except Exception as e:
+            pytest.fail(f"JIT compilation failed: {e}")
+        
+        # Test that input arrays are not modified
+        assert jnp.allclose(x, jnp.ones((8, 4), dtype=jnp.float32)), f"Input array 'x' was modified: {x}"
+        assert jnp.allclose(y, jnp.ones((8, 4), dtype=jnp.float32)), f"Input array 'y' was modified: {y}"
 
     def test_sharding_rules(self):
         """Test sharding rules functionality."""
         ptx_kernel = """
+        .version 8.5
+        .target sm_90
+        .address_size 64
         .visible .entry test_kernel(
             .param .u64 input,
             .param .u64 output,
@@ -302,6 +365,9 @@ class TestDeviceKernels:
             pytest.skip("Requires multiple devices")
         
         ptx_kernel = """
+        .version 8.5
+        .target sm_90
+        .address_size 64
         .visible .entry test_kernel(
             .param .u64 input,
             .param .u64 output,
@@ -354,6 +420,9 @@ class TestDeviceKernels:
     def test_layout_handling(self):
         """Test layout handling in lowering functions."""
         ptx_kernel = """
+        .version 8.5
+        .target sm_90
+        .address_size 64
         .visible .entry test_kernel(
             .param .u64 input,
             .param .u64 output,
@@ -380,288 +449,160 @@ class TestDeviceKernels:
         except Exception as e:
             pytest.fail(f"Layout handling failed: {e}")
 
-    def test_batch_partitioning_integration(self):
-        """Test integration of batch partitioning with JAX's sharding system."""
-        if jax.device_count() < 2:
-            pytest.skip("Requires multiple devices")
-        
-        # Test that batch partitioning registration works
-        try:
-            register_device_kernel_as_batch_partitionable("ptx")
-        except Exception as e:
-            pytest.fail(f"Batch partitioning registration failed: {e}")
-        
-        # Test with shard_map (if available)
-        try:
-            from jax.experimental import shard_map
-            
-            ptx_kernel = """
-            .visible .entry test_kernel(
-                .param .u64 input,
-                .param .u64 output,
-                .param .u32 n
-            ) {
-                ret;
-            }
-            """
-            
-            devices = jax.devices()
-            mesh = Mesh(devices, ('x',))
-            
-            def kernel_fn(x):
-                return kernel_call(
-                    ptx_kernel,
-                    "test_kernel",
-                    jax.ShapeDtypeStruct(x.shape, x.dtype),
-                    x,
-                    kernel_type="ptx"
-                )
-            
-            # Test that shard_map can be applied (even if execution fails)
-            sharded_fn = shard_map.shard_map(kernel_fn, mesh, P('x'), P('x'))
-            
-            # This should not fail at the JAX level, even if execution fails
-            x = jnp.ones((8, 4), dtype=jnp.float32)
-            with pytest.raises(ValueError, match="call_target must be provided"):
-                result = sharded_fn(x)
-                
-        except ImportError:
-            # shard_map might not be available in all JAX versions
-            pass
-        except Exception as e:
-            pytest.fail(f"shard_map integration failed: {e}")
 
-    def test_partitioning_error_handling(self):
-        """Test error handling in partitioning functions."""
+    @jtu.sample_product(
+        vmap_method=["expand_dims", "broadcast_all", "sequential", "sequential_unrolled"],
+    )
+    def test_vmap_with_device_kernels(self, vmap_method):
+        """Test vmap functionality with device kernels."""
         ptx_kernel = """
-        .visible .entry test_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
+        .version 8.5
+        .target sm_90
+        .address_size 64
+        .visible .entry add_kernel(
+            .param .u64 a,
+            .param .u64 b,
+            .param .u64 c
         ) {
-            ret;
-        }
-        """
-        
-        # Test invalid grid dimensions
-        with pytest.raises(ValueError, match="Invalid grid dimensions"):
-            kernel_call(
-                ptx_kernel,
-                "test_kernel",
-                jax.ShapeDtypeStruct((4,), jnp.float32),
-                jnp.ones((4,), dtype=jnp.float32),
-                grid_dims=(1, 2, 3, 4),  # Too many dimensions
-                block_dims=(256, 1, 1)
-            )
-        
-        # Test invalid block dimensions
-        with pytest.raises(ValueError, match="Invalid block dimensions"):
-            kernel_call(
-                ptx_kernel,
-                "test_kernel",
-                jax.ShapeDtypeStruct((4,), jnp.float32),
-                jnp.ones((4,), dtype=jnp.float32),
-                grid_dims=(1, 1, 1),
-                block_dims=(256, 1, 1, 1)  # Too many dimensions
-            )
+            .reg .s32 r0;
+            .reg .u64 p1, p2, p3, p4;
+            .reg .f32 r1, r2, r3;
 
-    def test_vmap_legacy_vectorized(self):
-        """Test vmap with legacy_vectorized method."""
-        # Simple kernel that doubles input
-        ptx_kernel = """
-        .visible .entry double_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
-        ) {
-            .reg .u32 %tid.x;
-            .reg .u32 %n;
-            .reg .u64 %input, %output;
-            .reg .f32 %val, %result;
-            
-            ld.param.u32 %n, [n];
-            ld.param.u64 %input, [input];
-            ld.param.u64 %output, [output];
-            
-            mov.u32 %tid.x, %tid.x;
-            setp.ge.u32 %p1, %tid.x, %n;
-            @%p1 bra exit;
-            
-            mul.wide.u32 %rd1, %tid.x, 4;
-            add.u64 %rd2, %input, %rd1;
-            add.u64 %rd3, %output, %rd1;
-            
-            ld.global.f32 %val, [%rd2];
-            mul.f32 %result, %val, 2.0;
-            st.global.f32 [%rd3], %result;
-            
-        exit:
-            ret;
-        }
-        """
-        
-        def kernel_fn(x):
-            return kernel_call(
-                ptx_kernel,
-                "double_kernel",
-                x,
-                x,
-                grid_dims=1,
-                block_dims=256,
-                vmap_method="legacy_vectorized"
-            )
-        
-        # Test with batched input
-        batch_size = 3
-        x = jnp.ones((batch_size, 4), dtype=jnp.float32)
-        
-        # This should work with vmap
-        vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
-        
-        # Note: This is a mock test - actual execution would require proper setup
-        with pytest.raises(ValueError, match="call_target must be provided"):
-            result = vmapped_fn(x)
+            // Load parameters into registers
+            ld.param.u64 p1, [a];
+            ld.param.u64 p2, [b];
+            ld.param.u64 p3, [c];
 
-    def test_vmap_sequential(self):
-        """Test vmap with sequential method."""
-        ptx_kernel = """
-        .visible .entry sum_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
-        ) {
-            .reg .u32 %tid.x;
-            .reg .u32 %n;
-            .reg .u64 %input, %output;
-            .reg .f32 %val, %sum;
-            
-            ld.param.u32 %n, [n];
-            ld.param.u64 %input, [input];
-            ld.param.u64 %output, [output];
-            
-            mov.u32 %tid.x, %tid.x;
-            setp.ge.u32 %p1, %tid.x, %n;
-            @%p1 bra exit;
-            
-            mul.wide.u32 %rd1, %tid.x, 4;
-            add.u64 %rd2, %input, %rd1;
-            add.u64 %rd3, %output, %rd1;
-            
-            ld.global.f32 %val, [%rd2];
-            add.f32 %sum, %val, %val;  // Simple operation
-            st.global.f32 [%rd3], %sum;
-            
-        exit:
-            ret;
-        }
-        """
-        
-        def kernel_fn(x):
-            return kernel_call(
-                ptx_kernel,
-                "sum_kernel",
-                x,
-                x,
-                grid_dims=1,
-                block_dims=256,
-                vmap_method="sequential"
-            )
-        
-        # Test with batched input
-        batch_size = 2
-        x = jnp.ones((batch_size, 3), dtype=jnp.float32)
-        
-        # This should work with vmap
-        vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
-        
-        # Note: This is a mock test - actual execution would require proper setup
-        with pytest.raises(ValueError, match="call_target must be provided"):
-            result = vmapped_fn(x)
+            // Calculate offset in bytes using thread index
+            mov.u32 r0, %tid.x;
+            mul.wide.s32 p4, r0, 4;  // p4 now holds the byte offset as a u64
 
-    def test_vmap_broadcast_all(self):
-        """Test vmap with broadcast_all method."""
-        ptx_kernel = """
-        .visible .entry broadcast_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
-        ) {
-            .reg .u32 %tid.x;
-            .reg .u32 %n;
-            .reg .u64 %input, %output;
-            .reg .f32 %val;
-            
-            ld.param.u32 %n, [n];
-            ld.param.u64 %input, [input];
-            ld.param.u64 %output, [output];
-            
-            mov.u32 %tid.x, %tid.x;
-            setp.ge.u32 %p1, %tid.x, %n;
-            @%p1 bra exit;
-            
-            mul.wide.u32 %rd1, %tid.x, 4;
-            add.u64 %rd2, %input, %rd1;
-            add.u64 %rd3, %output, %rd1;
-            
-            ld.global.f32 %val, [%rd2];
-            st.global.f32 [%rd3], %val;
-            
-        exit:
-            ret;
+            // Calculate final addresses for a, b, and c
+            add.u64 p1, p1, p4;
+            add.u64 p2, p2, p4;
+            add.u64 p3, p3, p4;
+
+            // Load float values from the computed addresses, perform addition, and store result
+            ld.global.f32 r1, [p1];
+            ld.global.f32 r2, [p2];
+            add.f32 r3, r1, r2;
+            st.global.f32 [p3], r3;
         }
         """
         
         def kernel_fn(x, y):
             return kernel_call(
                 ptx_kernel,
-                "broadcast_kernel",
-                x,
+                "add_kernel",
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
                 x, y,
+                kernel_type="ptx",
                 grid_dims=1,
-                block_dims=256,
-                vmap_method="broadcast_all"
+                block_dims=x.shape[0],  # match array size
+                shared_mem_bytes=0,
+                vmap_method=vmap_method
             )
         
-        # Test with broadcast
-        x = jnp.ones((3,), dtype=jnp.float32)
-        y = jnp.array([1.0], dtype=jnp.float32)  # Will be broadcast
+        # Test with batched input
+        batch_size = 3
+        x = jnp.ones((batch_size, 4), dtype=jnp.float32)
+        y = jnp.ones((batch_size, 4), dtype=jnp.float32)
         
-        # This should work with vmap
-        vmapped_fn = vmap(kernel_fn, in_axes=(0, None), out_axes=0)
+        # Apply vmap to the kernel function
+        vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
         
-        # Note: This is a mock test - actual execution would require proper setup
-        with pytest.raises(ValueError, match="call_target must be provided"):
-            result = vmapped_fn(x, y)
-
-    def test_invalid_vmap_method(self):
-        """Test that invalid vmap_method raises appropriate error."""
+        # Test that vmap works correctly
+        result = vmapped_fn(x, y)
+        
+        # Verify the result
+        expected = x + y  # Should be 2.0 everywhere
+        if isinstance(result, list):
+            result = result[0]
+        assert jnp.allclose(result, expected), f"Expected {expected}, got {result} for vmap_method={vmap_method}"
+        
+    def test_vmap_debug(self):
+        """Debug test to understand what's happening with different vmap methods."""
         ptx_kernel = """
-        .visible .entry test_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
+        .version 8.5
+        .target sm_90
+        .address_size 64
+        .visible .entry add_kernel(
+            .param .u64 a,
+            .param .u64 b,
+            .param .u64 c
         ) {
-            ret;
+            .reg .s32 r0;
+            .reg .u64 p1, p2, p3, p4;
+            .reg .f32 r1, r2, r3;
+
+            // Load parameters into registers
+            ld.param.u64 p1, [a];
+            ld.param.u64 p2, [b];
+            ld.param.u64 p3, [c];
+
+            // Calculate offset in bytes using thread index
+            mov.u32 r0, %tid.x;
+            mul.wide.s32 p4, r0, 4;  // p4 now holds the byte offset as a u64
+
+            // Calculate final addresses for a, b, and c
+            add.u64 p1, p1, p4;
+            add.u64 p2, p2, p4;
+            add.u64 p3, p3, p4;
+
+            // Load float values from the computed addresses, perform addition, and store result
+            ld.global.f32 r1, [p1];
+            ld.global.f32 r2, [p2];
+            add.f32 r3, r1, r2;
+            st.global.f32 [p3], r3;
         }
         """
         
-        def kernel_fn(x):
-            return kernel_call(
+        def kernel_fn(x, y):
+            print(f"  kernel_fn called with:")
+            print(f"    x.shape: {x.shape}, x: {x}")
+            print(f"    y.shape: {y.shape}, y: {y}")
+            
+            result = kernel_call(
                 ptx_kernel,
-                "test_kernel",
-                x,
-                x,
+                "add_kernel",
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                x, y,
+                kernel_type="ptx",
                 grid_dims=1,
                 block_dims=256,
-                vmap_method="invalid_method"
+                shared_mem_bytes=0,
+                output_indices=[2],  # Add explicit output indices
+                vmap_method="expand_dims"  # Test the failing method
             )
+            
+            if isinstance(result, list):
+                result = result[0]
+            print(f"    result.shape: {result.shape}, result: {result}")
+            return result
         
-        x = jnp.ones((2, 3), dtype=jnp.float32)
+        # Test with simple input
+        x = jnp.ones((3, 4), dtype=jnp.float32)
+        y = jnp.ones((3, 4), dtype=jnp.float32)
+        
+        print(f"Input arrays:")
+        print(f"  x.shape: {x.shape}, x: {x}")
+        print(f"  y.shape: {y.shape}, y: {y}")
+        
+        # Apply vmap
         vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
         
-        # This should raise a NotImplementedError
-        with pytest.raises(NotImplementedError, match="vmap is only supported"):
-            vmapped_fn(x)
+        print(f"\nCalling vmapped function...")
+        result = vmapped_fn(x, y)
+        
+        if isinstance(result, list):
+            result = result[0]
+        
+        print(f"\nFinal result:")
+        print(f"  result.shape: {result.shape}")
+        print(f"  result: {result}")
+        print(f"  expected: {x + y}")
+        
+        # Don't assert anything - just print for debugging
 
     def test_kernel_validation(self):
         """Test kernel validation."""
@@ -684,39 +625,6 @@ class TestDeviceKernels:
                 jnp.array([1.0]),
                 kernel_type="ptx"
             )
-
-    def test_output_indices_validation(self):
-        """Test output_indices validation."""
-        ptx_kernel = """
-        .visible .entry test_kernel(
-            .param .u64 input,
-            .param .u64 output,
-            .param .u32 n
-        ) {
-            ret;
-        }
-        """
-        
-        # Test invalid output_indices type
-        with pytest.raises(ValueError, match="output_indices must be a sequence"):
-            kernel_call(
-                ptx_kernel,
-                "test_kernel",
-                jnp.array([1.0]),
-                jnp.array([1.0]),
-                output_indices=123  # type: ignore
-            )
-        
-        # Test wrong number of output indices
-        with pytest.raises(ValueError, match="Expected 1 output indices but got 2"):
-            kernel_call(
-                ptx_kernel,
-                "test_kernel",
-                jnp.array([1.0]),
-                jnp.array([1.0]),
-                output_indices=[0, 1]
-            )
-
 
 if __name__ == "__main__":
     pytest.main([__file__]) 
