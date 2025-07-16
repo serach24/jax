@@ -86,8 +86,6 @@ class TestDeviceKernels(jtu.JaxTestCase):
             block_dims=(3, 1, 1),
             shared_mem_bytes=0,
         )
-        print("a", a)
-        print("b", b)
         # Verify the result
         expected = a + b  # [5.0, 7.0, 9.0]
         assert jnp.allclose(a, jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)) 
@@ -498,7 +496,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
                 x, y,
                 kernel_type="ptx",
                 grid_dims=1,
-                block_dims=x.shape[0],  # match array size
+                block_dims=16, 
                 shared_mem_bytes=0,
                 vmap_method=vmap_method
             )
@@ -520,90 +518,6 @@ class TestDeviceKernels(jtu.JaxTestCase):
             result = result[0]
         assert jnp.allclose(result, expected), f"Expected {expected}, got {result} for vmap_method={vmap_method}"
         
-    def test_vmap_debug(self):
-        """Debug test to understand what's happening with different vmap methods."""
-        ptx_kernel = """
-        .version 8.5
-        .target sm_90
-        .address_size 64
-        .visible .entry add_kernel(
-            .param .u64 a,
-            .param .u64 b,
-            .param .u64 c
-        ) {
-            .reg .s32 r0;
-            .reg .u64 p1, p2, p3, p4;
-            .reg .f32 r1, r2, r3;
-
-            // Load parameters into registers
-            ld.param.u64 p1, [a];
-            ld.param.u64 p2, [b];
-            ld.param.u64 p3, [c];
-
-            // Calculate offset in bytes using thread index
-            mov.u32 r0, %tid.x;
-            mul.wide.s32 p4, r0, 4;  // p4 now holds the byte offset as a u64
-
-            // Calculate final addresses for a, b, and c
-            add.u64 p1, p1, p4;
-            add.u64 p2, p2, p4;
-            add.u64 p3, p3, p4;
-
-            // Load float values from the computed addresses, perform addition, and store result
-            ld.global.f32 r1, [p1];
-            ld.global.f32 r2, [p2];
-            add.f32 r3, r1, r2;
-            st.global.f32 [p3], r3;
-        }
-        """
-        
-        def kernel_fn(x, y):
-            print(f"  kernel_fn called with:")
-            print(f"    x.shape: {x.shape}, x: {x}")
-            print(f"    y.shape: {y.shape}, y: {y}")
-            
-            result = kernel_call(
-                ptx_kernel,
-                "add_kernel",
-                jax.ShapeDtypeStruct(x.shape, x.dtype),
-                x, y,
-                kernel_type="ptx",
-                grid_dims=1,
-                block_dims=256,
-                shared_mem_bytes=0,
-                output_indices=[2],  # Add explicit output indices
-                vmap_method="expand_dims"  # Test the failing method
-            )
-            
-            if isinstance(result, list):
-                result = result[0]
-            print(f"    result.shape: {result.shape}, result: {result}")
-            return result
-        
-        # Test with simple input
-        x = jnp.ones((3, 4), dtype=jnp.float32)
-        y = jnp.ones((3, 4), dtype=jnp.float32)
-        
-        print(f"Input arrays:")
-        print(f"  x.shape: {x.shape}, x: {x}")
-        print(f"  y.shape: {y.shape}, y: {y}")
-        
-        # Apply vmap
-        vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
-        
-        print(f"\nCalling vmapped function...")
-        result = vmapped_fn(x, y)
-        
-        if isinstance(result, list):
-            result = result[0]
-        
-        print(f"\nFinal result:")
-        print(f"  result.shape: {result.shape}")
-        print(f"  result: {result}")
-        print(f"  expected: {x + y}")
-        
-        # Don't assert anything - just print for debugging
-
     def test_kernel_validation(self):
         """Test kernel validation."""
         # Test invalid kernel type
