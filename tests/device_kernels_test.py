@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
 import pytest
 
 import jax
 import jax.numpy as jnp
 from jax import vmap
 from jax._src.device_kernels import (
-    kernel_call, 
+   kernel_call,
     register_device_kernel_as_batch_partitionable,
     device_kernel_custom_partitioning,
     build_device_kernel_lowering_function,
@@ -71,10 +70,10 @@ class TestDeviceKernels(jtu.JaxTestCase):
             st.global.f32 [p3], r3;
         }
         """
-        
+
         a = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
         b = jnp.array([4.0, 5.0, 6.0], dtype=jnp.float32)
-        
+
         # Test that the kernel call executes successfully
         result = kernel_call(
             ptx_kernel,
@@ -88,7 +87,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
         )
         # Verify the result
         expected = a + b  # [5.0, 7.0, 9.0]
-        assert jnp.allclose(a, jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)) 
+        assert jnp.allclose(a, jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32))
         # assert jnp.allclose(b, jnp.array([4.0, 5.0, 6.0], dtype=jnp.float32))
         # assert jnp.allclose(expected, jnp.array([5.0, 7.0, 9.0], dtype=jnp.float32))
         if isinstance(result, list):
@@ -103,7 +102,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             # Should not raise an error
         except Exception as e:
             pytest.fail(f"register_device_kernel_as_batch_partitionable raised {e}")
-        
+
         # Test invalid kernel type
         with pytest.raises(ValueError, match="Unsupported kernel type"):
             register_device_kernel_as_batch_partitionable("invalid_type")
@@ -119,7 +118,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         # Test that the function can be created
         try:
             lowering_fn = build_device_kernel_lowering_function(
@@ -146,7 +145,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         # Test that the lowering rule can be created
         try:
             lowering_rule = kernel_lowering(
@@ -173,7 +172,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         @device_kernel_custom_partitioning(
             kernel_data=ptx_kernel,
             kernel_name="test_kernel",
@@ -181,11 +180,11 @@ class TestDeviceKernels(jtu.JaxTestCase):
         )
         def test_kernel_fn(x):
             return jax.ShapeDtypeStruct(x.shape, x.dtype)
-        
+
         # Test that the decorator creates a callable object
         assert hasattr(test_kernel_fn, 'def_partition')
         assert callable(test_kernel_fn.def_partition)
-        
+
         # Test that we can define partitioning strategy
         def partition_strategy(mesh, arg_shapes, result_shape):
             def lower_fn(x):
@@ -197,10 +196,10 @@ class TestDeviceKernels(jtu.JaxTestCase):
                     kernel_type="ptx"
                 )
             return mesh, lower_fn, result_shape.sharding, (arg_shapes[0].sharding,)
-        
+
         def infer_sharding(mesh, arg_shapes, result_shape):
             return arg_shapes[0].sharding
-        
+
         # Test that def_partition works
         try:
             test_kernel_fn.def_partition(
@@ -215,7 +214,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
         """Test batch partitioning and sharding preservation."""
         if jax.device_count() < 2:
             pytest.skip("Requires multiple devices")
-        
+
         ptx_kernel = """
         .version 8.5
         .target sm_90
@@ -238,11 +237,11 @@ class TestDeviceKernels(jtu.JaxTestCase):
             // Calculate 2D indices from thread and block IDs
             mov.u32 r0, %tid.x;     // thread index within block
             mov.u32 r1, %ctaid.x;   // block index
-            
+
             // Calculate row and column indices
             // For 2D array (8, 4): row = block_id, col = thread_id
             // row = r1, col = r0
-            
+
             // Calculate offset: (row * 4 + col) * 4 bytes
             mul.lo.s32 r2, r1, 4;   // row * 4
             add.s32 r2, r2, r0;     // + col
@@ -260,7 +259,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             st.global.f32 [p3], r3;
         }
         """
-        
+
         def kernel_fn(x, y):
             return kernel_call(
                 ptx_kernel,
@@ -273,38 +272,38 @@ class TestDeviceKernels(jtu.JaxTestCase):
                 shared_mem_bytes=0,
                 output_indices=[2]
             )
-        
+
         # Create mesh and sharded arrays
         devices = jax.devices()
         mesh = Mesh(devices, ('i',))
         x = jnp.ones((8, 4), dtype=jnp.float32)
         y = jnp.ones((8, 4), dtype=jnp.float32)
-        
+
         x_sharding = NamedSharding(mesh, P('i'))
         x = jax.device_put(x, x_sharding)
         y = jax.device_put(y, x_sharding)
-        
+
         # Test eager mode
         result_eager = kernel_fn(x, y)
-        
+
         # Test JIT mode with output sharding
         kernel_fn_jit = jax.jit(kernel_fn, out_shardings=x_sharding)
         result_jit = kernel_fn_jit(x, y)
-        
+
         # Verify results
         expected = x + y  # Should be 2.0 everywhere
         if isinstance(result_eager, list):
             result_eager = result_eager[0]
         if isinstance(result_jit, list):
             result_jit = result_jit[0]
-            
+
         assert jnp.allclose(result_eager, expected), f"Eager result incorrect: {result_eager}"
         assert jnp.allclose(result_jit, expected), f"JIT result incorrect: {result_jit}"
-        
+
         # Test that JIT result preserves sharding
         assert hasattr(result_jit, 'sharding'), "JIT result should have sharding"
         assert result_jit.sharding == x_sharding, f"Expected sharding {x_sharding}, got {result_jit.sharding}"
-        
+
         # Test compilation (this should not crash)
         try:
             compiled = kernel_fn_jit.lower(x, y).compile()
@@ -312,7 +311,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             # but the fact that it compiles without error is good
         except Exception as e:
             pytest.fail(f"JIT compilation failed: {e}")
-        
+
         # Test that input arrays are not modified
         assert jnp.allclose(x, jnp.ones((8, 4), dtype=jnp.float32)), f"Input array 'x' was modified: {x}"
         assert jnp.allclose(y, jnp.ones((8, 4), dtype=jnp.float32)), f"Input array 'y' was modified: {y}"
@@ -331,7 +330,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         @device_kernel_custom_partitioning(
             kernel_data=ptx_kernel,
             kernel_name="test_kernel",
@@ -339,7 +338,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
         )
         def test_kernel_fn(x):
             return jax.ShapeDtypeStruct(x.shape, x.dtype)
-        
+
         # Test different sharding rule formats
         sharding_rules = [
             'i j -> i j',  # Keep same sharding
@@ -347,7 +346,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             'i j k -> i k',  # Drop middle dimension
             '...i -> ...i',  # Ellipsis notation
         ]
-        
+
         for rule in sharding_rules:
             try:
                 test_kernel_fn.def_partition(
@@ -361,7 +360,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
         """Test custom partitioning with mesh configuration."""
         if jax.device_count() < 2:
             pytest.skip("Requires multiple devices")
-        
+
         ptx_kernel = """
         .version 8.5
         .target sm_90
@@ -374,7 +373,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         @device_kernel_custom_partitioning(
             kernel_data=ptx_kernel,
             kernel_name="test_kernel",
@@ -382,12 +381,12 @@ class TestDeviceKernels(jtu.JaxTestCase):
         )
         def test_kernel_fn(x):
             return jax.ShapeDtypeStruct(x.shape, x.dtype)
-        
+
         def partition_strategy(mesh, arg_shapes, result_shape):
             # Test that we can access mesh information
             assert hasattr(mesh, 'shape')
             assert hasattr(mesh, 'axis_names')
-            
+
             def lower_fn(x):
                 return kernel_call(
                     ptx_kernel,
@@ -396,16 +395,16 @@ class TestDeviceKernels(jtu.JaxTestCase):
                     x,
                     kernel_type="ptx"
                 )
-            
+
             # Return the mesh and lowering function
             return mesh, lower_fn, result_shape.sharding, (arg_shapes[0].sharding,)
-        
+
         def infer_sharding(mesh, arg_shapes, result_shape):
             # Test that we can access mesh and shapes
             assert hasattr(mesh, 'shape')
             assert len(arg_shapes) > 0
             return arg_shapes[0].sharding
-        
+
         # Test that the partitioning strategy works
         try:
             test_kernel_fn.def_partition(
@@ -429,7 +428,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             ret;
         }
         """
-        
+
         # Test with custom operand and result layouts
         try:
             lowering_fn = build_device_kernel_lowering_function(
@@ -487,7 +486,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
             st.global.f32 [p3], r3;
         }
         """
-        
+
         def kernel_fn(x, y):
             return kernel_call(
                 ptx_kernel,
@@ -496,28 +495,28 @@ class TestDeviceKernels(jtu.JaxTestCase):
                 x, y,
                 kernel_type="ptx",
                 grid_dims=1,
-                block_dims=16, 
+                block_dims=16,
                 shared_mem_bytes=0,
                 vmap_method=vmap_method
             )
-        
+
         # Test with batched input
         batch_size = 3
         x = jnp.ones((batch_size, 4), dtype=jnp.float32)
         y = jnp.ones((batch_size, 4), dtype=jnp.float32)
-        
+
         # Apply vmap to the kernel function
         vmapped_fn = vmap(kernel_fn, in_axes=0, out_axes=0)
-        
+
         # Test that vmap works correctly
         result = vmapped_fn(x, y)
-        
+
         # Verify the result
         expected = x + y  # Should be 2.0 everywhere
         if isinstance(result, list):
             result = result[0]
         assert jnp.allclose(result, expected), f"Expected {expected}, got {result} for vmap_method={vmap_method}"
-        
+
     def test_kernel_validation(self):
         """Test kernel validation."""
         # Test invalid kernel type
@@ -529,7 +528,7 @@ class TestDeviceKernels(jtu.JaxTestCase):
                 jnp.array([1.0]),
                 kernel_type="invalid_type"
             )
-        
+
         # Test PTX kernel without .entry
         with pytest.raises(ValueError, match="PTX code must contain an .entry point"):
             kernel_call(
@@ -540,5 +539,97 @@ class TestDeviceKernels(jtu.JaxTestCase):
                 kernel_type="ptx"
             )
 
+    def test_empty_arrays(self):
+        """Test kernel with empty arrays."""
+        ptx_kernel = """
+        .version 8.5
+        .target sm_90
+        .address_size 64
+        .visible .entry add_kernel(
+            .param .u64 a,
+            .param .u64 b,
+            .param .u64 c
+        ) {
+            ret;
+        }
+        """
+
+        # Test with empty arrays
+        a = jnp.array([], dtype=jnp.float32)
+        b = jnp.array([], dtype=jnp.float32)
+
+        result = kernel_call(
+            ptx_kernel,
+            "add_kernel",
+            jax.ShapeDtypeStruct(a.shape, a.dtype),
+            a, b,
+            kernel_type="ptx",
+            grid_dims=1,
+            block_dims=1,
+            shared_mem_bytes=0,
+        )
+
+        if isinstance(result, list):
+            result = result[0]
+        assert result.shape == (0,)
+        assert result.dtype == jnp.float32
+
+    def test_jit_with_kernel(self):
+        """Test that kernels work with JIT compilation."""
+        ptx_kernel = """
+        .version 8.5
+        .target sm_90
+        .address_size 64
+        .visible .entry add_kernel(
+            .param .u64 a,
+            .param .u64 b,
+            .param .u64 c
+        ) {
+            .reg .s32 r0;
+            .reg .u64 p1, p2, p3, p4;
+            .reg .f32 r1, r2, r3;
+
+            mov.u32 r0, %tid.x;
+            mul.wide.s32 p4, r0, 4;
+
+            ld.param.u64 p1, [a];
+            ld.param.u64 p2, [b];
+            ld.param.u64 p3, [c];
+
+            add.u64 p1, p1, p4;
+            add.u64 p2, p2, p4;
+            add.u64 p3, p3, p4;
+
+            ld.global.f32 r1, [p1];
+            ld.global.f32 r2, [p2];
+            add.f32 r3, r1, r2;
+            st.global.f32 [p3], r3;
+        }
+        """
+
+        def kernel_fn(x, y):
+            return kernel_call(
+                ptx_kernel,
+                "add_kernel",
+                jax.ShapeDtypeStruct(x.shape, x.dtype),
+                x, y,
+                kernel_type="ptx",
+                grid_dims=1,
+                block_dims=4,
+                shared_mem_bytes=0,
+            )
+
+        # Test JIT compilation
+        jitted_fn = jax.jit(kernel_fn)
+        x = jnp.ones((4,), dtype=jnp.float32)
+        y = jnp.ones((4,), dtype=jnp.float32)
+
+        result = jitted_fn(x, y)
+        expected = x + y
+
+        if isinstance(result, list):
+            result = result[0]
+        assert jnp.allclose(result, expected)
+
 if __name__ == "__main__":
-    pytest.main([__file__]) 
+    pytest.main([__file__])

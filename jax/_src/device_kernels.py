@@ -14,17 +14,11 @@
 
 
 from jax._src import core
-from jax._src.typing import (Array, ArrayLike, DeprecatedArg, DuckTypedArray,
-                             Shape)
-from jax._src.callback import _check_shape_dtype
+from jax._src.typing import (Array, ArrayLike, DeprecatedArg, DuckTypedArray)
 
 from jax._src.interpreters import mlir
 
 from jax._src.lib.mlir import ir
-
-from jax._src.layout import Layout
-
-import numpy as np
 
 from typing import Any, Callable
 
@@ -49,11 +43,6 @@ import functools
 from jax._src.lib import xla_client
 from jax._src import xla_bridge
 
-# Import for sharding rule support
-from jax._src.custom_partitioning_sharding_rule import (
-    SdyShardingRule, str_to_sdy_sharding_rule
-)
-
 map, unsafe_map = util.safe_map, map
 
 # Create wrapper functions to maintain dict interface
@@ -77,17 +66,17 @@ SUPPORTED_KERNEL_TYPES: list[str] = list(KERNEL_TYPE_TO_CALL_TARGET.keys())
 
 def register_device_kernel_as_batch_partitionable(kernel_type: str) -> None:
   """Registers a device kernel type as batch partitionable.
-  
+
   This allows the kernel to be automatically partitioned across leading dimensions
   without requiring custom partitioning logic. The kernel will be executed
   independently on each shard of data.
-  
+
   Args:
     kernel_type: The kernel type to register (e.g., "ptx")
   """
   if kernel_type not in SUPPORTED_KERNEL_TYPES:
     raise ValueError(f"Unsupported kernel type: {kernel_type}. Supported types are: {SUPPORTED_KERNEL_TYPES}")
-  
+
   call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
   xla_client.register_custom_call_as_batch_partitionable(call_target)
   xla_bridge.register_plugin_callbacks(
@@ -160,24 +149,24 @@ def build_device_kernel_lowering_function(
         "shared_mem_bytes": shared_mem_bytes,
         "output_indices": output_indices_val,
     }
-    
+
     backend_config = {k: mlir.ir_attribute(v) for k, v in backend_config.items()}
 
     kwargs = dict(lowering_args)
     kwargs.setdefault("api_version", 4)
     kwargs["backend_config"] = backend_config
     kwargs["has_side_effect"] = has_side_effect
-    
+
     if "result_types" not in kwargs:
       kwargs["result_types"] = [mlir.aval_to_ir_type(aval) for aval in ctx.avals_out]
-    
+
     if operand_layouts is None:
       kwargs["operand_layouts"] = map(_convert_layout_for_lowering, ctx.avals_in)
     else:
       kwargs["operand_layouts"] = [
           _convert_layout_for_lowering(*args)
           for args in zip(ctx.avals_in, operand_layouts)]
-    
+
     if result_layouts is None:
       kwargs["result_layouts"] = map(_convert_layout_for_lowering, ctx.avals_out)
     else:
@@ -283,10 +272,10 @@ def kernel_call(
     **kwargs: Any,
 ) -> Array | list[Array]:  # type: ignore
     """Call a device kernel with the specified kernel type.
-    
+
     Currently supported kernel types:
     - ptx: NVIDIA PTX kernel code for CUDA GPUs
-    
+
     Args:
         kernel_data: Source code for the kernel
         kernel_name: Name of the kernel function to call
@@ -301,7 +290,7 @@ def kernel_call(
         vmap_method: Method for vmapping the kernel
         vectorized: Whether the kernel is vectorized
         **kwargs: Additional arguments for specific kernel types
-        
+
     Returns:
         Result array(s) from kernel execution
     """
@@ -337,7 +326,7 @@ def kernel_call(
 
     grid_dims, block_dims = _normalize_grid_block_dims(grid_dims, block_dims)
     call_target = KERNEL_TYPE_TO_CALL_TARGET[kernel_type]
-  
+
     kernel_kwargs = {
         "grid_x": grid_dims[0],
         "grid_y": grid_dims[1],
@@ -350,14 +339,14 @@ def kernel_call(
         "call_target": call_target,
         **kwargs,
     }
-    
+
     results = kernel_call_p.bind(
         *args,
         result_avals=result_avals,
         vectorized=vectorized,
         vmap_method=vmap_method,
         kernel_name=kernel_name,
-        kernel_data=kernel_data,  
+        kernel_data=kernel_data,
         has_side_effect=has_side_effect,
         **_wrap_kwargs_hashable(kernel_kwargs),
     )
@@ -376,10 +365,10 @@ def device_kernel_custom_partitioning(
     vectorized: bool | DeprecatedArg = DeprecatedArg(),
 ):
   """Decorator for creating device kernels with custom partitioning support.
-  
+
   This decorator allows you to define custom partitioning strategies for device kernels,
   similar to how `custom_partitioning` works for general JAX operations.
-  
+
   Args:
     kernel_data: Source code for the kernel
     kernel_name: Name of the kernel function to call
@@ -391,7 +380,7 @@ def device_kernel_custom_partitioning(
     output_indices: Indices of outputs in argument list
     vmap_method: Method for vmapping the kernel
     vectorized: Whether the kernel is vectorized
-    
+
   Returns:
     A decorator function that can be applied to a function to create a custom
     partitioned device kernel.
@@ -404,12 +393,12 @@ def device_kernel_custom_partitioning(
         self.propagate_user_sharding = None
         self.infer_sharding_from_operands = None
         self.sharding_rule = None
-        
+
       def def_partition(self, partition, infer_sharding_from_operands=None,
                         propagate_user_sharding=None, decode_shardings=True,
                         sharding_rule=None):
         """Define custom partitioning strategy for the device kernel.
-        
+
         Args:
           partition: Callable that takes mesh, arg_shapes, result_shape and returns
             mesh, lower_fn, result_sharding, arg_shardings
@@ -424,7 +413,7 @@ def device_kernel_custom_partitioning(
         self.decode_shardings = decode_shardings
         self.sharding_rule = sharding_rule
         return partition
-        
+
       def __call__(self, *args, **kwargs):
         # Create the kernel call with the specified parameters
         return kernel_call(
@@ -441,9 +430,9 @@ def device_kernel_custom_partitioning(
             vmap_method=vmap_method,
             vectorized=vectorized,
         )
-    
+
     return DeviceKernelCustomPartitioning(fun)
-  
+
   return decorator
 
 class KernelEffect(effects.Effect):
@@ -457,19 +446,13 @@ effects.control_flow_allowed_effects.add_type(KernelEffect)
 def kernel_call_abstract_eval(
     *avals_in,
     result_avals: tuple[core.AbstractValue, ...],
-    kernel_data: str,
-    kernel_name: str,
-    vectorized: bool | DeprecatedArg,
-    vmap_method: str | None,
     has_side_effect: bool,
-    **kwargs: Any,
+    **_,
 ):
-    del avals_in, kernel_name, kernel_data, vectorized, vmap_method, kwargs
-    if has_side_effect:
-        effects = {_KernelEffect}  # Use the defined KernelEffect when has_side_effect is True
-    else:
-        effects = core.no_effects
-    return result_avals, effects
+    out_vma = core.standard_vma_rule('kernel_call', *avals_in)
+    effects = {_KernelEffect} if has_side_effect else core.no_effects
+    return tuple(r if r is core.abstract_token else r.update(vma=out_vma)
+               for r in result_avals), effects
 
 
 def kernel_call_jvp(*args, kernel_name, **_):
@@ -574,11 +557,11 @@ def kernel_call_lowering(
     has_side_effect: bool,
     **kwargs: Any,
 ) -> Sequence[ir.Value]:
-    
+
     call_target = kwargs.get("call_target")
     if call_target is None:
         raise ValueError("call_target must be provided")
-    
+
     rule = kernel_lowering(
         kernel_data,
         kernel_name,
@@ -591,8 +574,8 @@ def kernel_call_lowering(
         operand_layouts=kwargs.get("operand_layouts"),
         result_layouts=kwargs.get("result_layouts"),
     )
-    
-    return rule(ctx, *operands)
+
+    return rule(ctx, *operands, **_unwrap_kwargs_hashable(kwargs))
 
 kernel_call_p = core.Primitive("kernel_call")
 kernel_call_p.multiple_results = True
